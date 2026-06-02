@@ -6,3 +6,11 @@ license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+[dependencies]
+datum-blocktemplates = { path = "../datum-blocktemplates" }
+datum-coinbaser = { path = "../datum-coinbaser" }
+datum-dupes = { path = "../datum-dupes" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }

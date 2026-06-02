@@ -1,7 +1,11 @@
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::Arc;
 
+use datum_api::{ApiState, MetricsSource};
 use datum_config::{Config, ConfigError};
+use serde_json::{json, Value};
 
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_PATH: &str = "./datum_gateway_config.json";
@@ -33,29 +37,115 @@ fn main() -> ExitCode {
                 ExitCode::from(1)
             }
         },
-        Cmd::Run { config } => {
-            eprintln!("datum_gateway {PKG_VERSION} ({git_sha})");
-            match validate_config(&config) {
-                Ok(()) => {
-                    eprintln!("config OK: {}", config.display());
-                    eprintln!(
-                        "not yet implemented: gateway runtime is built incrementally over Phase 1-4"
-                    );
-                    eprintln!("Working today: --version, --validate-config, --example-conf");
-                    ExitCode::from(1)
-                }
-                Err(report) => {
-                    eprintln!("{report}");
-                    ExitCode::from(1)
-                }
-            }
-        }
+        Cmd::Run { config } => run(&config, git_sha),
         Cmd::ParseError(msg) => {
             eprintln!("error: {msg}");
             eprintln!();
             print_help();
             ExitCode::from(1)
         }
+    }
+}
+
+fn run(config_path: &PathBuf, git_sha: &str) -> ExitCode {
+    eprintln!("datum_gateway {PKG_VERSION} ({git_sha})");
+
+    let cfg = match Config::from_file(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(errs) = cfg.validate() {
+        eprintln!(
+            "error: {} validation issue(s) in {}:",
+            errs.len(),
+            config_path.display()
+        );
+        for e in errs {
+            eprintln!("  - {e}");
+        }
+        return ExitCode::from(1);
+    }
+    eprintln!("config OK: {}", config_path.display());
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            eprintln!("error: tokio runtime: {e}");
+            return ExitCode::from(1);
+        }
+    };
+
+    rt.block_on(async move {
+        run_async(cfg).await;
+    });
+    ExitCode::SUCCESS
+}
+
+async fn run_async(cfg: Config) {
+    tracing_subscriber::fmt::init();
+
+    let metrics: Arc<dyn MetricsSource> = Arc::new(StubMetrics);
+    let app = datum_api::router(ApiState { metrics });
+
+    let api_addr: SocketAddr = format!("{}:{}", api_addr_or_default(&cfg), cfg.api.listen_port)
+        .parse()
+        .expect("api listen_addr/listen_port parses");
+
+    if cfg.api.listen_port == 0 {
+        tracing::info!("API listen_port=0; HTTP API disabled");
+        std::future::pending::<()>().await;
+        return;
+    }
+
+    tracing::info!(%api_addr, "datum_gateway: HTTP API binding");
+    let listener = match tokio::net::TcpListener::bind(api_addr).await {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::error!(%api_addr, error = %e, "API bind failed");
+            return;
+        }
+    };
+
+    let shutdown = async {
+        let ctrl_c = tokio::signal::ctrl_c();
+        match ctrl_c.await {
+            Ok(()) => tracing::info!("SIGINT/Ctrl-C received; shutting down"),
+            Err(e) => tracing::warn!(error = %e, "ctrl_c handler failed"),
+        }
+    };
+
+    if let Err(e) = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown)
+        .await
+    {
+        tracing::error!(error = %e, "axum server exited with error");
+    }
+}
+
+fn api_addr_or_default(cfg: &Config) -> &str {
+    if cfg.api.listen_addr.is_empty() {
+        "0.0.0.0"
+    } else {
+        &cfg.api.listen_addr
+    }
+}
+
+struct StubMetrics;
+impl MetricsSource for StubMetrics {
+    fn snapshot(&self) -> Value {
+        json!({
+            "version": PKG_VERSION,
+            "miner_count": 0,
+            "share_rate_5m": 0.0,
+            "ocean_connected": false,
+            "note": "alpha — stratum/protocol runtimes not yet wired"
+        })
     }
 }
 
@@ -132,7 +222,10 @@ USAGE:\n\
 \n\
 DEFAULT CONFIG PATH: {DEFAULT_CONFIG_PATH}\n\
 \n\
-This is alpha software. The gateway runtime (`-c PATH`) is not yet wired up.\n\
-Today --version, --validate-config, --example-conf work end-to-end.\n"
+This is alpha software. Today --version, --validate-config, --example-conf,\n\
+and the HTTP API skeleton at api.listen_port work end-to-end. Stratum SV1/SV2\n\
+servers and the encrypted DATUM upstream client are scaffolded but not yet\n\
+wired into the run loop — block submission against live OCEAN is not\n\
+operational. See the v0.1.0 release notes for the runtime checklist.\n"
     );
 }

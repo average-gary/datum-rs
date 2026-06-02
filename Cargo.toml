@@ -11,6 +11,7 @@ members = [
     "crates/datum-stratum-sv2",
     "crates/datum-dupes",
     "crates/datum-api",
+    "crates/datum-logger",
     "crates/datum-bin",
 ]
 
