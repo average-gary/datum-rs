@@ -6,3 +6,7 @@ license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+[dependencies]
+lru = "0.16"
+parking_lot = "0.12"

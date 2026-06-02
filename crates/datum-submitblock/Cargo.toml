@@ -6,3 +6,9 @@ license.workspace = true
 rust-version.workspace = true
 authors.workspace = true
 repository.workspace = true
+
+[dependencies]
+datum-rpc = { path = "../datum-rpc" }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
