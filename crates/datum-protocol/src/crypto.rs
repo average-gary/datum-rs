@@ -19,6 +19,15 @@ pub trait DatumCrypto: Send + Sync {
         plaintext: &[u8],
     ) -> Result<Vec<u8>, CryptoError>;
 
+    /// Inverse of `box_seal`: given a ciphertext sealed to our X25519
+    /// keypair, recover the plaintext.
+    fn box_seal_open(
+        &self,
+        ciphertext: &[u8],
+        recipient_x25519_pub: &[u8; 32],
+        recipient_x25519_sec: &[u8; 32],
+    ) -> Result<Vec<u8>, CryptoError>;
+
     /// XSalsa20Poly1305 (libsodium default — NOT ChaCha20-Poly1305). See the
     /// wiki article datum-protocol-rust-implementation § critical correction.
     /// Output layout matches libsodium's `crypto_box_easy_afternm`: `mac || ct`
@@ -42,6 +51,26 @@ pub trait DatumCrypto: Send + Sync {
         their_x25519_pubkey: &[u8; 32],
         our_x25519_secret: &[u8; 32],
     ) -> Result<[u8; 32], CryptoError>;
+
+    /// Generate a fresh Ed25519 keypair `(public[32], secret[64])`. Secret is
+    /// libsodium's seed||pubkey concatenation (matches `dryoc::sign`).
+    fn sign_keypair(&self) -> ([u8; 32], [u8; 64]);
+
+    /// Detached Ed25519 signature over `message` using `secret_key` (the
+    /// 64-byte libsodium-format secret). Returns the 64-byte signature.
+    fn sign_detached(&self, message: &[u8], secret_key: &[u8; 64])
+        -> Result<[u8; 64], CryptoError>;
+
+    /// Verify an Ed25519 detached signature. Returns Ok(()) iff valid.
+    fn verify_detached(
+        &self,
+        message: &[u8],
+        signature: &[u8; 64],
+        public_key: &[u8; 32],
+    ) -> Result<(), CryptoError>;
+
+    /// Generate a fresh X25519 keypair `(public[32], secret[32])`.
+    fn box_keypair(&self) -> ([u8; 32], [u8; 32]);
 
     fn random_bytes(&self, n: usize) -> Vec<u8>;
 }
@@ -75,6 +104,28 @@ impl DatumCrypto for DryocCrypto {
             .map_err(|e| CryptoError::Dryoc(e.to_string()))?
             .to_vec();
         Ok(sealed)
+    }
+
+    fn box_seal_open(
+        &self,
+        ciphertext: &[u8],
+        recipient_x25519_pub: &[u8; 32],
+        recipient_x25519_sec: &[u8; 32],
+    ) -> Result<Vec<u8>, CryptoError> {
+        use dryoc::classic::crypto_box::crypto_box_seal_open;
+        const CRYPTO_BOX_SEALBYTES: usize = 48;
+        if ciphertext.len() < CRYPTO_BOX_SEALBYTES {
+            return Err(CryptoError::InvalidKeyLength);
+        }
+        let mut pt = vec![0u8; ciphertext.len() - CRYPTO_BOX_SEALBYTES];
+        crypto_box_seal_open(
+            &mut pt,
+            ciphertext,
+            recipient_x25519_pub,
+            recipient_x25519_sec,
+        )
+        .map_err(|e| CryptoError::Dryoc(e.to_string()))?;
+        Ok(pt)
     }
 
     fn box_easy_afternm(
@@ -117,6 +168,40 @@ impl DatumCrypto for DryocCrypto {
     ) -> Result<[u8; 32], CryptoError> {
         use dryoc::classic::crypto_box::crypto_box_beforenm;
         Ok(crypto_box_beforenm(their_x25519_pubkey, our_x25519_secret))
+    }
+
+    fn sign_keypair(&self) -> ([u8; 32], [u8; 64]) {
+        use dryoc::classic::crypto_sign::crypto_sign_keypair;
+        crypto_sign_keypair()
+    }
+
+    fn sign_detached(
+        &self,
+        message: &[u8],
+        secret_key: &[u8; 64],
+    ) -> Result<[u8; 64], CryptoError> {
+        use dryoc::classic::crypto_sign::crypto_sign_detached;
+        let mut sig = [0u8; 64];
+        crypto_sign_detached(&mut sig, message, secret_key)
+            .map_err(|e| CryptoError::Dryoc(e.to_string()))?;
+        Ok(sig)
+    }
+
+    fn verify_detached(
+        &self,
+        message: &[u8],
+        signature: &[u8; 64],
+        public_key: &[u8; 32],
+    ) -> Result<(), CryptoError> {
+        use dryoc::classic::crypto_sign::crypto_sign_verify_detached;
+        crypto_sign_verify_detached(signature, message, public_key)
+            .map_err(|e| CryptoError::Dryoc(e.to_string()))
+    }
+
+    fn box_keypair(&self) -> ([u8; 32], [u8; 32]) {
+        use dryoc::classic::crypto_box::crypto_box_keypair;
+        let (pk, sk) = crypto_box_keypair();
+        (pk, sk)
     }
 
     fn random_bytes(&self, n: usize) -> Vec<u8> {

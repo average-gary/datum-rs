@@ -10,10 +10,15 @@
 
 pub mod crypto;
 pub mod frame;
+pub mod handshake;
 pub mod obfuscation;
 pub mod opcodes;
 
 pub use crypto::{CryptoError, DatumCrypto, DryocCrypto};
 pub use frame::{FrameError, FrameHeader, HEADER_LEN, MAX_CMD_LEN};
-pub use obfuscation::{mm3_fmix32, HeaderObfuscator, HEADER_OBFUSCATION_INIT};
+pub use handshake::{
+    build_hello_payload, frame_for_hello, parse_received_header, seal_hello, ClientKeypairs,
+    HandshakeError, CRYPTO_BOX_SEAL_BYTES, HELLO_PROTO_CMD, HELLO_SENTINEL,
+};
+pub use obfuscation::{datum_header_xor_feedback, HeaderObfuscator, INITIAL_SENDING_HEADER_KEY};
 pub use opcodes::ProtoCmd;
