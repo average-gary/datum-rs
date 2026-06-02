@@ -309,7 +309,11 @@ dependencies = [
 name = "datum-blocktemplates"
 version = "0.0.1"
 dependencies = [
+ "datum-coinbaser",
  "datum-rpc",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "serde",
  "serde_json",
  "thiserror",

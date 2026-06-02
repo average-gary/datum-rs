@@ -7,7 +7,6 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::watch;
 
-pub const DEFAULT_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(75);
 pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize)]
@@ -91,7 +90,6 @@ impl TemplateChannel {
 pub struct TemplatePuller {
     client: Arc<Client>,
     rules: Vec<String>,
-    long_poll_timeout: Duration,
     backoff: Duration,
     tx: watch::Sender<Option<Arc<Template>>>,
 }
@@ -105,16 +103,10 @@ impl TemplatePuller {
         let puller = Self {
             client,
             rules: rules.into_iter().collect(),
-            long_poll_timeout: DEFAULT_LONG_POLL_TIMEOUT,
             backoff: DEFAULT_BACKOFF,
             tx,
         };
         (puller, TemplateChannel { rx })
-    }
-
-    pub fn with_long_poll_timeout(mut self, t: Duration) -> Self {
-        self.long_poll_timeout = t;
-        self
     }
 
     pub fn with_backoff(mut self, t: Duration) -> Self {
