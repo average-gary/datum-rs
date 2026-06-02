@@ -1,0 +1,42 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/datum-config",
+    "crates/datum-rpc",
+    "crates/datum-blocktemplates",
+    "crates/datum-coinbaser",
+    "crates/datum-submitblock",
+    "crates/datum-protocol",
+    "crates/datum-stratum-sv1",
+    "crates/datum-stratum-sv2",
+    "crates/datum-dupes",
+    "crates/datum-api",
+    "crates/datum-bin",
+]
+
+[workspace.package]
+version = "0.0.1"
+edition = "2021"
+license = "MIT"
+rust-version = "1.83"
+authors = ["Gary Krause"]
+repository = "https://github.com/average-gary/datum-rs"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+dryoc = "0.8"
+axum = "0.7"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+corepc-types = "0.14"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+tracing-appender = "0.2"
+thiserror = "2"
+bytes = "1"
+hex = "0.4"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
