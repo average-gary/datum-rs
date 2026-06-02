@@ -18,7 +18,7 @@ members = [
 version = "0.0.1"
 edition = "2021"
 license = "MIT"
-rust-version = "1.83"
+rust-version = "1.86"
 authors = ["Gary Krause"]
 repository = "https://github.com/average-gary/datum-rs"
 
