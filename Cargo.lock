@@ -332,6 +332,7 @@ dependencies = [
  "datum-stratum-sv1",
  "datum-stratum-sv2",
  "datum-submitblock",
+ "hex",
  "parking_lot",
  "serde_json",
  "tokio",

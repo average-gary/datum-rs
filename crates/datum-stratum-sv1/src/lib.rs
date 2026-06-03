@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use thiserror::Error;
 
+pub mod assembler;
 pub mod server;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

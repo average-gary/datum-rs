@@ -160,6 +160,7 @@ impl CoinbaserChannel {
     }
 }
 
+#[derive(Clone)]
 pub struct CoinbaserPublisher {
     tx: watch::Sender<Option<Arc<CoinbaserBlob>>>,
 }

@@ -129,33 +129,119 @@ async fn run_async(cfg: Config) {
     let sv2_registry = datum_stratum_sv2::ChannelRegistry::new();
     runtime.set_sv2_registry(sv2_registry.clone());
 
-    // RPC client construction. We never actually connect at startup — bitcoind
-    // may not be reachable yet — but we surface the configured target in
-    // metrics so operators can spot misconfiguration via the API.
-    if !cfg.bitcoind.rpcurl.is_empty() {
-        let auth = if !cfg.bitcoind.rpccookiefile.is_empty() {
-            Some(datum_rpc::Auth::Cookie(
-                cfg.bitcoind.rpccookiefile.clone().into(),
-            ))
-        } else if !cfg.bitcoind.rpcuser.is_empty() {
-            Some(datum_rpc::Auth::UserPass {
-                user: cfg.bitcoind.rpcuser.clone(),
-                pass: cfg.bitcoind.rpcpassword.clone(),
-            })
-        } else {
-            None
-        };
-        if let Some(auth) = auth {
-            match datum_rpc::Client::new(cfg.bitcoind.rpcurl.clone(), auth) {
-                Ok(client) => {
+    // RPC client + template puller. If the operator hasn't configured a
+    // bitcoind endpoint yet, the gateway runs in "stratum-only / awaiting
+    // bitcoind" mode — useful for operator pre-flight.
+    let template_channel: Option<datum_blocktemplates::TemplateChannel> =
+        if !cfg.bitcoind.rpcurl.is_empty() {
+            let auth = if !cfg.bitcoind.rpccookiefile.is_empty() {
+                Some(datum_rpc::Auth::Cookie(
+                    cfg.bitcoind.rpccookiefile.clone().into(),
+                ))
+            } else if !cfg.bitcoind.rpcuser.is_empty() {
+                Some(datum_rpc::Auth::UserPass {
+                    user: cfg.bitcoind.rpcuser.clone(),
+                    pass: cfg.bitcoind.rpcpassword.clone(),
+                })
+            } else {
+                None
+            };
+            match auth
+                .and_then(|auth| datum_rpc::Client::new(cfg.bitcoind.rpcurl.clone(), auth).ok())
+            {
+                Some(client) => {
                     runtime.set_rpc_url(cfg.bitcoind.rpcurl.clone());
                     tracing::info!(rpcurl = %cfg.bitcoind.rpcurl, "datum-rpc client constructed");
-                    let _ = client; // template-puller wiring is the next swing
+                    let rpc = std::sync::Arc::new(client);
+                    let (puller, ch) =
+                        datum_blocktemplates::TemplatePuller::new(rpc, ["segwit".to_string()]);
+                    tokio::spawn(puller.run());
+                    Some(ch)
                 }
-                Err(e) => {
-                    tracing::warn!(error = %e, "failed to build datum-rpc client");
+                None => {
+                    tracing::warn!("bitcoind RPC auth missing; template puller not spawned");
+                    None
                 }
             }
+        } else {
+            tracing::warn!("bitcoind.rpcurl empty; template puller not spawned");
+            None
+        };
+
+    // Coinbaser channel. The DATUM upstream task is responsible for fetching
+    // the OCEAN coinbaser blob and publishing it. Until that lands here,
+    // operators running against a real OCEAN endpoint will see notifies
+    // gated on the first coinbaser response from upstream.
+    let (coinbaser_pub, coinbaser_sub) = datum_coinbaser::CoinbaserPublisher::new();
+
+    // Assembler task: when both channels have a value, build mining.notify
+    // params and broadcast to all subscribed SV1 miners. Re-runs on either
+    // channel changing.
+    if let Some(template_ch) = template_channel.clone() {
+        let notify_tx_for_assembler = notify_tx.clone();
+        let mut t_sub = template_ch.clone();
+        let mut c_sub = coinbaser_sub.clone();
+        let coinbase_tag = cfg.mining.coinbase_tag_primary.clone();
+        tokio::spawn(async move {
+            let mut job_counter: u64 = 1;
+            loop {
+                tokio::select! {
+                    biased;
+                    t = t_sub.changed() => { if t.is_err() { return; } }
+                    c = c_sub.changed() => { if c.is_err() { return; } }
+                }
+                let template = match template_ch.current() {
+                    Some(t) => t,
+                    None => continue,
+                };
+                let coinbaser = match coinbaser_sub.current() {
+                    Some(c) => c,
+                    None => continue,
+                };
+                let job_id = format!("{job_counter:016x}");
+                let params = datum_stratum_sv1::assembler::assemble_notify(
+                    &job_id,
+                    &template,
+                    &coinbaser,
+                    coinbase_tag.as_bytes(),
+                    true,
+                );
+                if notify_tx_for_assembler
+                    .send(Some(params.to_json_array()))
+                    .is_err()
+                {
+                    return;
+                }
+                job_counter = job_counter.wrapping_add(1);
+            }
+        });
+    }
+
+    // DATUM upstream task. Spawn it lazily; if the connect fails we log and
+    // retry on a fixed backoff. The first successful connect publishes a
+    // CoinbaserResponse which unblocks the assembler.
+    {
+        let pool_host = cfg.datum.pool_host.clone();
+        let pool_port = cfg.datum.pool_port;
+        let pool_pubkey_hex = cfg.datum.pool_pubkey.clone();
+        let mining_pool_address = cfg.mining.pool_address.clone();
+        let coinbaser_pub = coinbaser_pub;
+        if !pool_host.is_empty() && !pool_pubkey_hex.is_empty() {
+            tokio::spawn(async move {
+                if let Err(e) = run_datum_upstream(
+                    &pool_host,
+                    pool_port,
+                    &pool_pubkey_hex,
+                    &mining_pool_address,
+                    coinbaser_pub,
+                )
+                .await
+                {
+                    tracing::error!(error = %e, "datum upstream task exited with error");
+                }
+            });
+        } else {
+            tracing::warn!("datum.pool_host or pool_pubkey empty; DATUM upstream task not spawned");
         }
     }
 
@@ -211,6 +297,110 @@ async fn wait_for_shutdown() {
     match ctrl_c.await {
         Ok(()) => tracing::info!("SIGINT/Ctrl-C received; shutting down"),
         Err(e) => tracing::warn!(error = %e, "ctrl_c handler failed"),
+    }
+}
+
+/// Drive the DATUM upstream connection. On connect, push the OCEAN-supplied
+/// coinbaser blob to `coinbaser_pub` so the assembler can build notifies.
+/// Reconnects on disconnect with a fixed backoff.
+async fn run_datum_upstream(
+    pool_host: &str,
+    pool_port: u16,
+    pool_pubkey_hex: &str,
+    _mining_pool_address: &str,
+    coinbaser_pub: datum_coinbaser::CoinbaserPublisher,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let pool_pubkey =
+        hex::decode(pool_pubkey_hex).map_err(|e| format!("decode pool pubkey hex: {e}"))?;
+    if pool_pubkey.len() != 64 {
+        return Err(format!(
+            "pool pubkey must be 64 bytes (128 hex chars); got {}",
+            pool_pubkey.len()
+        )
+        .into());
+    }
+    let pool_x25519: [u8; 32] = pool_pubkey[32..].try_into().unwrap();
+
+    let endpoint = format!("{pool_host}:{pool_port}");
+    let backoff = std::time::Duration::from_secs(5);
+
+    loop {
+        tracing::info!(%endpoint, "DATUM upstream: connecting");
+        match datum_protocol::DatumClient::connect(
+            &endpoint,
+            &pool_x25519,
+            "v0.4.1-beta",
+            "/datum-rs runtime",
+            std::time::Duration::from_secs(30),
+        )
+        .await
+        {
+            Ok(connected) => {
+                tracing::info!(motd = %connected.motd, "DATUM handshake complete");
+
+                let connected = std::sync::Arc::new(connected);
+                let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
+                let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(64);
+
+                let coinbaser_pub = coinbaser_pub.clone();
+                let event_loop = {
+                    let conn = connected.clone();
+                    tokio::spawn(async move { conn.run(events_tx, commands_rx).await })
+                };
+
+                let _ = commands_tx
+                    .send(datum_protocol::UpstreamCommand::RequestCoinbaser)
+                    .await;
+
+                while let Some(event) = events_rx.recv().await {
+                    match event {
+                        datum_protocol::UpstreamEvent::Coinbaser(resp) => {
+                            tracing::info!(
+                                value = resp.coinbase_value,
+                                blob_len = resp.v2_blob.len(),
+                                "coinbaser response received"
+                            );
+                            match datum_coinbaser::parse_v2_blob(&resp.v2_blob, resp.coinbase_value)
+                            {
+                                Ok(blob) => {
+                                    if coinbaser_pub.publish(blob).is_err() {
+                                        tracing::warn!("coinbaser_pub: no subscribers");
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::warn!(error = %e, "failed to parse v2 blob");
+                                }
+                            }
+                        }
+                        datum_protocol::UpstreamEvent::ClientConfig(cfg) => {
+                            tracing::info!(
+                                prime_id = cfg.prime_id,
+                                vardiff_min = cfg.vardiff_min,
+                                "client_config received from pool"
+                            );
+                        }
+                        datum_protocol::UpstreamEvent::ShareResponse(resp) => {
+                            tracing::debug!(?resp, "share response");
+                        }
+                        datum_protocol::UpstreamEvent::BlockNotify(_) => {
+                            tracing::info!("block_notify from pool");
+                        }
+                        datum_protocol::UpstreamEvent::JobValidationRequest(_) => {
+                            tracing::debug!("job validation request from pool (not yet handled)");
+                        }
+                        datum_protocol::UpstreamEvent::UnknownFrame { proto_cmd, .. } => {
+                            tracing::debug!(?proto_cmd, "unknown frame from pool");
+                        }
+                    }
+                }
+                event_loop.abort();
+                tracing::warn!("DATUM event stream closed");
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "DATUM upstream connect failed");
+            }
+        }
+        tokio::time::sleep(backoff).await;
     }
 }
 

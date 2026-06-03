@@ -8,6 +8,7 @@
 //! live-OCEAN handshake against `datum-beta1.mine.ocean.xyz:28915` is the
 //! release gate (tracked in inventory: `ocean-production-protocol-version`).
 
+pub mod client;
 pub mod crypto;
 pub mod frame;
 pub mod handshake;
@@ -15,6 +16,8 @@ pub mod messages;
 pub mod mock_pool;
 pub mod obfuscation;
 pub mod opcodes;
+
+pub use client::{ClientError, Connected, DatumClient, UpstreamCommand, UpstreamEvent};
 
 pub use crypto::{CryptoError, DatumCrypto, DryocCrypto};
 pub use frame::{FrameError, FrameHeader, HEADER_LEN, MAX_CMD_LEN};
