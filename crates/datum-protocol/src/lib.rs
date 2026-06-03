@@ -11,6 +11,7 @@
 pub mod crypto;
 pub mod frame;
 pub mod handshake;
+pub mod messages;
 pub mod obfuscation;
 pub mod opcodes;
 
@@ -19,6 +20,11 @@ pub use frame::{FrameError, FrameHeader, HEADER_LEN, MAX_CMD_LEN};
 pub use handshake::{
     build_hello_payload, frame_for_hello, parse_received_header, seal_hello, ClientKeypairs,
     HandshakeError, CRYPTO_BOX_SEAL_BYTES, HELLO_PROTO_CMD, HELLO_SENTINEL,
+};
+pub use messages::{
+    CoinbaserFetchRequest, MessageError, ShareResponse, ShareStatus, CLIENT_CONFIG_OPCODE,
+    COINBASER_FETCH_OPCODE, COINBASER_RESPONSE_OPCODE, JOB_VALIDATION_OPCODE, SHARE_ACCEPTED,
+    SHARE_ACCEPTED_TENTATIVELY, SHARE_REJECTED, SHARE_RESPONSE_OPCODE,
 };
 pub use obfuscation::{datum_header_xor_feedback, HeaderObfuscator, INITIAL_SENDING_HEADER_KEY};
 pub use opcodes::ProtoCmd;
