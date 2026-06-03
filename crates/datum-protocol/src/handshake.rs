@@ -107,13 +107,15 @@ pub fn build_hello_payload(
     }
 
     let mut buf =
-        Vec::with_capacity(128 + version.len() + client_id.len() + 2 + 1 + 4 + padding.len() + 64);
+        Vec::with_capacity(128 + version.len() + client_id.len() + 1 + 1 + 4 + padding.len() + 64);
     buf.extend_from_slice(&keys.long_term_ed25519_pub);
     buf.extend_from_slice(&keys.long_term_x25519_pub);
     buf.extend_from_slice(&keys.session_ed25519_pub);
     buf.extend_from_slice(&keys.session_x25519_pub);
+    // Per datum_protocol.c:1002-1016: version and client_id are concatenated
+    // without a NUL between them; a single NUL terminates the whole text
+    // section before the sentinel.
     buf.extend_from_slice(version.as_bytes());
-    buf.push(0);
     buf.extend_from_slice(client_id.as_bytes());
     buf.push(0);
     buf.push(HELLO_SENTINEL);
@@ -202,18 +204,20 @@ mod tests {
         assert_eq!(&payload[64..96], &keys.session_ed25519_pub[..]);
         assert_eq!(&payload[96..128], &keys.session_x25519_pub[..]);
 
-        let version = b"v0.4.1-beta\0";
+        let version = b"v0.4.1-beta";
         assert_eq!(&payload[128..128 + version.len()], version);
         let after_version = 128 + version.len();
-        let client_id = b"/test\0";
+        let client_id = b"/test";
         assert_eq!(
             &payload[after_version..after_version + client_id.len()],
             client_id
         );
-        let after_client = after_version + client_id.len();
-        assert_eq!(payload[after_client], HELLO_SENTINEL);
+        let after_text = after_version + client_id.len();
+        assert_eq!(payload[after_text], 0);
+        let after_nul = after_text + 1;
+        assert_eq!(payload[after_nul], HELLO_SENTINEL);
 
-        let nk_offset = after_client + 1;
+        let nk_offset = after_nul + 1;
         assert_eq!(
             u32::from_le_bytes(payload[nk_offset..nk_offset + 4].try_into().unwrap()),
             0xdead_beef

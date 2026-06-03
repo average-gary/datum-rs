@@ -231,40 +231,12 @@ async fn probe(opts: &Opts) -> Result<String, ProbeError> {
         .await
         .map_err(|_| ProbeError::SendTimeout(timeout_dur))??;
 
-    let mut whatever = Vec::new();
-    let read_result = timeout(timeout_dur, rd.read_to_end(&mut whatever)).await;
-    if let Some(path) = &opts.save_capture {
-        let mut capture = Vec::new();
-        capture.extend_from_slice(b"# datum-rs handshake_probe capture\n");
-        capture.extend_from_slice(format!("# endpoint: {endpoint}\n").as_bytes());
-        capture.extend_from_slice(format!("# version: {version}\n").as_bytes());
-        capture.extend_from_slice(format!("# nk: {nk:#010x}\n").as_bytes());
-        capture.extend_from_slice(format!("# sent_len: {}\n", framed.len()).as_bytes());
-        capture.extend_from_slice(format!("# recv_len: {}\n", whatever.len()).as_bytes());
-        capture.extend_from_slice(b"## sent\n");
-        capture.extend_from_slice(&framed);
-        capture.extend_from_slice(b"\n## recv\n");
-        capture.extend_from_slice(&whatever);
-        std::fs::write(path, capture)?;
-    }
-    tracing::info!(
-        sent = framed.len(),
-        recv = whatever.len(),
-        "transfer complete"
-    );
-
-    if whatever.len() < 4 {
-        return Err(ProbeError::OversizedResponse {
-            got: whatever.len() as u32,
-        });
-    }
-
-    let header_buf: [u8; 4] = whatever[0..4].try_into().unwrap();
-    match read_result {
-        Ok(Ok(_)) => {}
-        Ok(Err(e)) => return Err(ProbeError::Io(e)),
-        Err(_) => return Err(ProbeError::RecvTimeout(timeout_dur)),
-    }
+    // Read exactly 4 bytes (response frame header) — pool keeps connection
+    // open after the handshake response, so we cannot wait for EOF.
+    let mut header_buf = [0u8; 4];
+    timeout(timeout_dur, rd.read_exact(&mut header_buf))
+        .await
+        .map_err(|_| ProbeError::RecvTimeout(timeout_dur))??;
     let mut receiver_obf = HeaderObfuscator::for_receiver(nk);
     let resp_header = parse_received_header(&mut receiver_obf, header_buf)?;
 
@@ -281,12 +253,28 @@ async fn probe(opts: &Opts) -> Result<String, ProbeError> {
         });
     }
 
-    if whatever.len() < 4 + resp_header.cmd_len as usize {
-        return Err(ProbeError::UndersizedResponse {
-            got: whatever.len() as u32,
-        });
+    let mut sealed_resp_owned = vec![0u8; resp_header.cmd_len as usize];
+    timeout(timeout_dur, rd.read_exact(&mut sealed_resp_owned))
+        .await
+        .map_err(|_| ProbeError::RecvTimeout(timeout_dur))??;
+    let sealed_resp = sealed_resp_owned.as_slice();
+
+    if let Some(path) = &opts.save_capture {
+        let mut capture = Vec::new();
+        capture.extend_from_slice(b"# datum-rs handshake_probe capture\n");
+        capture.extend_from_slice(format!("# endpoint: {endpoint}\n").as_bytes());
+        capture.extend_from_slice(format!("# version: {version}\n").as_bytes());
+        capture.extend_from_slice(format!("# nk: {nk:#010x}\n").as_bytes());
+        capture.extend_from_slice(format!("# sent_len: {}\n", framed.len()).as_bytes());
+        capture.extend_from_slice(format!("# recv_len: {}\n", 4 + sealed_resp.len()).as_bytes());
+        capture.extend_from_slice(b"## sent\n");
+        capture.extend_from_slice(&framed);
+        capture.extend_from_slice(b"\n## recv-header\n");
+        capture.extend_from_slice(&header_buf);
+        capture.extend_from_slice(b"\n## recv-body\n");
+        capture.extend_from_slice(sealed_resp);
+        std::fs::write(path, capture)?;
     }
-    let sealed_resp = &whatever[4..4 + resp_header.cmd_len as usize];
 
     let response_cmd = ProtoCmd::from_bits(resp_header.proto_cmd);
     if !matches!(response_cmd, ProtoCmd::Pong) {

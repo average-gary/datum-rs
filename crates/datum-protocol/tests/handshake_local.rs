@@ -68,15 +68,13 @@ async fn full_handshake_round_trip() {
             .verify_detached(signed_part, &signature, &client_lt_ed_pub)
             .expect("server verify hello signature");
 
-        let nul1 = plaintext[128..].iter().position(|&b| b == 0).unwrap();
-        let after_version = 128 + nul1 + 1;
-        let nul2 = plaintext[after_version..]
-            .iter()
-            .position(|&b| b == 0)
-            .unwrap();
-        let after_client_id = after_version + nul2 + 1;
-        assert_eq!(plaintext[after_client_id], 0xFE);
-        let nk_offset = after_client_id + 1;
+        // Per datum_protocol.c:1002-1018: version + client_id are written
+        // back-to-back with no NUL between them; a single NUL terminates
+        // the whole text section before the 0xFE sentinel.
+        let nul = plaintext[128..].iter().position(|&b| b == 0).unwrap();
+        let after_text = 128 + nul + 1;
+        assert_eq!(plaintext[after_text], 0xFE);
+        let nk_offset = after_text + 1;
         let nk = u32::from_le_bytes(plaintext[nk_offset..nk_offset + 4].try_into().unwrap());
 
         let mut response = Vec::with_capacity(192 + server_motd.len() + 1);
