@@ -1,0 +1,1 @@
+{"id":null,"method":"mining.notify","params":["PLACEHOLDER","00","11","22",[],"20000000","1d00ffff","67123456",true]}
