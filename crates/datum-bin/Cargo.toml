@@ -24,7 +24,7 @@ datum-rpc = { path = "../datum-rpc" }
 datum-stratum-sv1 = { path = "../datum-stratum-sv1" }
 datum-stratum-sv2 = { path = "../datum-stratum-sv2" }
 datum-submitblock = { path = "../datum-submitblock" }
+parking_lot = "0.12"
 serde_json = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }

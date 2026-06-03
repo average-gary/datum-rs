@@ -65,6 +65,14 @@ pub enum MessageError {
     BadSubOpcode { got: u8, expected: u8 },
     #[error("invalid share-response status byte: {0:#04x}")]
     BadShareStatus(u8),
+    #[error("invalid client-configuration version: got {got}, expected 1")]
+    BadConfigVersion { got: u8 },
+    #[error("missing client-configuration trailer (expected 0x00 0xFE)")]
+    MissingConfigTrailer,
+    #[error("invalid coinbaser-response length field: blob_len={blob_len}, body trailing bytes={trailing}")]
+    BadCoinbaserLength { blob_len: u32, trailing: usize },
+    #[error("share extranonce length must be 12, got {got}")]
+    BadExtranonceLength { got: u8 },
 }
 
 /// `proto_cmd = 0x10` body for a client→pool coinbaser-fetch request.
@@ -146,6 +154,288 @@ impl ShareResponse {
     }
 }
 
+/// `proto_cmd = 0x05` `sub = 0x11` body: pool's coinbaser response containing
+/// the V2 blob (see `datum-coinbaser` for blob format). Per
+/// `datum_protocol.c:275-318`:
+///
+/// - bytes 0-7: coinbase value (LE u64)
+/// - bytes 8-11: blob length (LE u32; must be in [1, 32767] and ≤ trailing-bytes)
+/// - bytes 12..12+blob_len: V2 coinbaser blob
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoinbaserResponse {
+    pub coinbase_value: u64,
+    pub v2_blob: Vec<u8>,
+}
+
+impl CoinbaserResponse {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(12 + self.v2_blob.len());
+        out.extend_from_slice(&self.coinbase_value.to_le_bytes());
+        out.extend_from_slice(&(self.v2_blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(&self.v2_blob);
+        out
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
+        if body.len() < 12 {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: 12,
+            });
+        }
+        let coinbase_value = u64::from_le_bytes(body[..8].try_into().unwrap());
+        let blob_len = u32::from_le_bytes(body[8..12].try_into().unwrap());
+        let trailing = body.len() - 12;
+        if !(1..=32767).contains(&blob_len) || (blob_len as usize) > trailing {
+            return Err(MessageError::BadCoinbaserLength { blob_len, trailing });
+        }
+        Ok(CoinbaserResponse {
+            coinbase_value,
+            v2_blob: body[12..12 + blob_len as usize].to_vec(),
+        })
+    }
+}
+
+/// `proto_cmd = 0x05` `sub = 0x99` body: pool-pushed configuration override.
+/// Per `datum_protocol.c:390-435`:
+///
+/// - byte 0: config version (must be 1)
+/// - byte 1: pool scriptsig length N
+/// - bytes 2..2+N: pool scriptsig
+/// - bytes 2+N..6+N: prime_id (LE u32)
+/// - byte 6+N: pool coinbase tag length M
+/// - bytes 7+N..7+N+M: pool coinbase tag
+/// - bytes 7+N+M..15+N+M: vardiff_min (LE u64)
+/// - bytes 15+N+M..17+N+M: trailer 0x00 0xFE
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientConfig {
+    pub pool_scriptsig: Vec<u8>,
+    pub prime_id: u32,
+    pub pool_coinbase_tag: Vec<u8>,
+    pub vardiff_min: u64,
+}
+
+impl ClientConfig {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.push(1);
+        out.push(self.pool_scriptsig.len() as u8);
+        out.extend_from_slice(&self.pool_scriptsig);
+        out.extend_from_slice(&self.prime_id.to_le_bytes());
+        out.push(self.pool_coinbase_tag.len() as u8);
+        out.extend_from_slice(&self.pool_coinbase_tag);
+        out.extend_from_slice(&self.vardiff_min.to_le_bytes());
+        out.push(0);
+        out.push(0xFE);
+        out
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
+        let mut i = 0usize;
+        if body.is_empty() {
+            return Err(MessageError::TooShort { got: 0, need: 1 });
+        }
+        if body[i] != 1 {
+            return Err(MessageError::BadConfigVersion { got: body[i] });
+        }
+        i += 1;
+
+        if i >= body.len() {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: i + 1,
+            });
+        }
+        let scriptsig_len = body[i] as usize;
+        i += 1;
+        if i + scriptsig_len > body.len() {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: i + scriptsig_len,
+            });
+        }
+        let pool_scriptsig = body[i..i + scriptsig_len].to_vec();
+        i += scriptsig_len;
+
+        if i + 4 > body.len() {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: i + 4,
+            });
+        }
+        let prime_id = u32::from_le_bytes(body[i..i + 4].try_into().unwrap());
+        i += 4;
+
+        if i >= body.len() {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: i + 1,
+            });
+        }
+        let tag_len = body[i] as usize;
+        i += 1;
+        if i + tag_len > body.len() {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: i + tag_len,
+            });
+        }
+        let pool_coinbase_tag = body[i..i + tag_len].to_vec();
+        i += tag_len;
+
+        if i + 8 > body.len() {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: i + 8,
+            });
+        }
+        let vardiff_min = u64::from_le_bytes(body[i..i + 8].try_into().unwrap());
+        i += 8;
+
+        if i + 2 > body.len() {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: i + 2,
+            });
+        }
+        if body[i] != 0 || body[i + 1] != 0xFE {
+            return Err(MessageError::MissingConfigTrailer);
+        }
+
+        Ok(ClientConfig {
+            pool_scriptsig,
+            prime_id,
+            pool_coinbase_tag,
+            vardiff_min,
+        })
+    }
+}
+
+/// `proto_cmd = 0x27` body: client→pool share submission. Fixed-prefix portion
+/// (29 bytes). The variable-length suffix (username, optional merkle-branch
+/// payload) is left for the runtime to assemble; this struct covers the prefix
+/// that's identical across every share submission per `datum_protocol.c:1329-
+/// 1340`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShareSubmissionPrefix {
+    pub job_id: u8,
+    pub coinbase_id: u8,
+    pub flags: u8,
+    pub target_byte: u8,
+    pub ntime: u32,
+    pub nonce: u32,
+    pub version: u32,
+    pub extranonce: [u8; 12],
+}
+
+/// 30 bytes: 1 opcode + 4 single-byte fields + 3 LE u32s + 1 xn_len + 12 extranonce.
+pub const SHARE_SUBMISSION_PREFIX_LEN: usize = 30;
+
+impl ShareSubmissionPrefix {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(SHARE_SUBMISSION_PREFIX_LEN);
+        out.push(0x27);
+        out.push(self.job_id);
+        out.push(self.coinbase_id);
+        out.push(self.flags);
+        out.push(self.target_byte);
+        out.extend_from_slice(&self.ntime.to_le_bytes());
+        out.extend_from_slice(&self.nonce.to_le_bytes());
+        out.extend_from_slice(&self.version.to_le_bytes());
+        out.push(12);
+        out.extend_from_slice(&self.extranonce);
+        out
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
+        if body.len() < SHARE_SUBMISSION_PREFIX_LEN {
+            return Err(MessageError::TooShort {
+                got: body.len(),
+                need: SHARE_SUBMISSION_PREFIX_LEN,
+            });
+        }
+        if body[0] != 0x27 {
+            return Err(MessageError::BadSubOpcode {
+                got: body[0],
+                expected: 0x27,
+            });
+        }
+        let xn_len = body[17];
+        if xn_len != 12 {
+            return Err(MessageError::BadExtranonceLength { got: xn_len });
+        }
+        Ok(ShareSubmissionPrefix {
+            job_id: body[1],
+            coinbase_id: body[2],
+            flags: body[3],
+            target_byte: body[4],
+            ntime: u32::from_le_bytes(body[5..9].try_into().unwrap()),
+            nonce: u32::from_le_bytes(body[9..13].try_into().unwrap()),
+            version: u32::from_le_bytes(body[13..17].try_into().unwrap()),
+            extranonce: body[18..30].try_into().unwrap(),
+        })
+    }
+}
+
+/// `proto_cmd = 0xF9` body: pool-pushed block-found notification (a peer in
+/// the network mined a new tip). The C reference treats the whole frame as a
+/// single binary payload of variable length used to short-circuit GBT polls.
+/// We surface the body bytes verbatim — the contents are best handled at the
+/// runtime level (refresh template).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockNotify {
+    pub payload: Vec<u8>,
+}
+
+impl BlockNotify {
+    pub fn encode(&self) -> Vec<u8> {
+        self.payload.clone()
+    }
+
+    pub fn decode(body: &[u8]) -> Self {
+        BlockNotify {
+            payload: body.to_vec(),
+        }
+    }
+}
+
+/// `proto_cmd = 0x05` `sub = 0x50` body: job-validation. Three sub-sub
+/// commands per `datum_protocol.c:862-883`:
+/// - `0x10`: pool requests stxids list for a job.
+/// - `0x11`: pool requests specific transactions by id.
+/// - `0x12`: pool requests the entire serialized block (minus coinbase).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JobValidationCmd {
+    StxidsList,
+    StxidsListById,
+    SerializedBlock,
+}
+
+impl JobValidationCmd {
+    pub fn opcode(self) -> u8 {
+        match self {
+            JobValidationCmd::StxidsList => 0x10,
+            JobValidationCmd::StxidsListById => 0x11,
+            JobValidationCmd::SerializedBlock => 0x12,
+        }
+    }
+
+    pub fn decode(body: &[u8]) -> Result<Self, MessageError> {
+        if body.is_empty() {
+            return Err(MessageError::TooShort { got: 0, need: 1 });
+        }
+        match body[0] {
+            0x10 => Ok(JobValidationCmd::StxidsList),
+            0x11 => Ok(JobValidationCmd::StxidsListById),
+            0x12 => Ok(JobValidationCmd::SerializedBlock),
+            other => Err(MessageError::BadSubOpcode {
+                got: other,
+                expected: 0x10,
+            }),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -223,6 +513,150 @@ mod tests {
         assert!(matches!(
             ShareResponse::decode(&body),
             Err(MessageError::BadShareStatus(0xCC))
+        ));
+    }
+
+    #[test]
+    fn coinbaser_response_round_trip() {
+        let resp = CoinbaserResponse {
+            coinbase_value: 312_500_000,
+            v2_blob: vec![0xAA, 0xBB, 0xCC, 0xDD],
+        };
+        let bytes = resp.encode();
+        assert_eq!(bytes.len(), 12 + 4);
+        let decoded = CoinbaserResponse::decode(&bytes).unwrap();
+        assert_eq!(decoded, resp);
+    }
+
+    #[test]
+    fn coinbaser_response_rejects_zero_blob() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&0u32.to_le_bytes());
+        assert!(matches!(
+            CoinbaserResponse::decode(&bytes),
+            Err(MessageError::BadCoinbaserLength { blob_len: 0, .. })
+        ));
+    }
+
+    #[test]
+    fn coinbaser_response_rejects_overlong_blob_len() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&100u64.to_le_bytes());
+        bytes.extend_from_slice(&100u32.to_le_bytes());
+        bytes.extend_from_slice(&[0xAA, 0xBB]);
+        assert!(matches!(
+            CoinbaserResponse::decode(&bytes),
+            Err(MessageError::BadCoinbaserLength {
+                blob_len: 100,
+                trailing: 2
+            })
+        ));
+    }
+
+    #[test]
+    fn client_config_round_trip() {
+        let cfg = ClientConfig {
+            pool_scriptsig: vec![0x01, 0x02, 0x03],
+            prime_id: 0xCAFE_BABE,
+            pool_coinbase_tag: b"ocean-tag".to_vec(),
+            vardiff_min: 16384,
+        };
+        let bytes = cfg.encode();
+        assert_eq!(*bytes.last().unwrap(), 0xFE);
+        let decoded = ClientConfig::decode(&bytes).unwrap();
+        assert_eq!(decoded, cfg);
+    }
+
+    #[test]
+    fn client_config_rejects_bad_version() {
+        let bytes = vec![2u8, 0, 0xFE];
+        assert!(matches!(
+            ClientConfig::decode(&bytes),
+            Err(MessageError::BadConfigVersion { got: 2 })
+        ));
+    }
+
+    #[test]
+    fn client_config_rejects_missing_trailer() {
+        let cfg = ClientConfig {
+            pool_scriptsig: vec![],
+            prime_id: 0,
+            pool_coinbase_tag: vec![],
+            vardiff_min: 0,
+        };
+        let mut bytes = cfg.encode();
+        let last = bytes.len() - 1;
+        bytes[last] = 0xFD;
+        assert!(matches!(
+            ClientConfig::decode(&bytes),
+            Err(MessageError::MissingConfigTrailer)
+        ));
+    }
+
+    #[test]
+    fn share_submission_prefix_round_trip() {
+        let p = ShareSubmissionPrefix {
+            job_id: 7,
+            coinbase_id: 1,
+            flags: 0b0000_0011,
+            target_byte: 0x10,
+            ntime: 0x6712_3456,
+            nonce: 0xCAFE_BABE,
+            version: 0x2000_0000,
+            extranonce: [0x11; 12],
+        };
+        let bytes = p.encode();
+        assert_eq!(bytes.len(), SHARE_SUBMISSION_PREFIX_LEN);
+        assert_eq!(bytes[0], 0x27);
+        assert_eq!(bytes[17], 12);
+        let decoded = ShareSubmissionPrefix::decode(&bytes).unwrap();
+        assert_eq!(decoded, p);
+    }
+
+    #[test]
+    fn share_submission_rejects_bad_extranonce_length() {
+        let mut bytes = vec![0u8; SHARE_SUBMISSION_PREFIX_LEN];
+        bytes[0] = 0x27;
+        bytes[17] = 8;
+        assert!(matches!(
+            ShareSubmissionPrefix::decode(&bytes),
+            Err(MessageError::BadExtranonceLength { got: 8 })
+        ));
+    }
+
+    #[test]
+    fn block_notify_round_trip() {
+        let payload = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x01];
+        let n = BlockNotify::decode(&payload);
+        assert_eq!(n.payload, payload);
+        assert_eq!(n.encode(), payload);
+    }
+
+    #[test]
+    fn job_validation_decode_each_sub() {
+        assert_eq!(
+            JobValidationCmd::decode(&[0x10]).unwrap(),
+            JobValidationCmd::StxidsList
+        );
+        assert_eq!(
+            JobValidationCmd::decode(&[0x11]).unwrap(),
+            JobValidationCmd::StxidsListById
+        );
+        assert_eq!(
+            JobValidationCmd::decode(&[0x12]).unwrap(),
+            JobValidationCmd::SerializedBlock
+        );
+    }
+
+    #[test]
+    fn job_validation_rejects_unknown_sub() {
+        assert!(matches!(
+            JobValidationCmd::decode(&[0xFF]),
+            Err(MessageError::BadSubOpcode {
+                got: 0xFF,
+                expected: 0x10
+            })
         ));
     }
 }

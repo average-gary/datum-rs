@@ -1,15 +1,25 @@
 //! Stratum V1 server side.
 //!
-//! Phase 3 status: SV1 message types + JSON envelope round-trips +
-//! extranonce layout helper land here. The full direct-serve runtime
-//! (`mining.subscribe`, `mining.authorize`, vardiff loop, share validation
-//! against the 8-job ring) is deferred — it requires a tokio TCP listener
-//! and golden-vector tests against a running C `datum_gateway` to confirm
-//! byte-exact `mining.notify` parity.
+//! Phase 3 status:
+//! - Message types + JSON envelope round-trips: shipped.
+//! - Per-connection state machine (subscribe → authorize → notify → submit):
+//!   shipped with mock-tested server task.
+//! - The 8-job ring + share validation against real Bitcoin PoW: deferred
+//!   until we have a way to feed real templates into the integration test.
+//!   The submit handler validates message shape, dedup-keys against
+//!   `datum-dupes`, and acks with a structured response.
+//! - Vardiff: documented in `vardiff.rs` constants but not yet driving the
+//!   set_difficulty cadence — needs real share-rate signal from the runtime.
+//!
+//! Per [gateway-internals-c-architecture] § extranonce layout: SV1 uses
+//! `extranonce1 = (thread_id << 22) | (client_id ^ 0xB10CF00D)` (32 bits).
+//! Preserved verbatim for grep-parity with C operator alerts.
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{json, Value};
 use thiserror::Error;
+
+pub mod server;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StratumRequest {
@@ -26,6 +36,24 @@ pub struct StratumResponse {
     pub result: Value,
     #[serde(default)]
     pub error: Value,
+}
+
+impl StratumResponse {
+    pub fn ok(id: Value, result: Value) -> Self {
+        Self {
+            id,
+            result,
+            error: Value::Null,
+        }
+    }
+
+    pub fn err(id: Value, code: i64, message: &str) -> Self {
+        Self {
+            id,
+            result: Value::Null,
+            error: json!([code, message, Value::Null]),
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -50,8 +78,6 @@ pub enum SubmitError {
 
 /// SV1 extranonce1 layout per `gateway-internals-c-architecture` § extranonce
 /// layout: `extranonce1 = (thread_id << 22) | (client_id ^ 0xB10CF00D)`.
-/// 32-bit field. The 0xB10CF00D mask keeps collision distinguishability in
-/// logs — preserved verbatim for parity with the C gateway.
 pub fn extranonce1(thread_id: u16, client_id: u32) -> u32 {
     ((thread_id as u32) << 22) | (client_id ^ 0xB10C_F00D)
 }
@@ -59,14 +85,12 @@ pub fn extranonce1(thread_id: u16, client_id: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
 
     #[test]
     fn extranonce1_layout() {
-        let xn = extranonce1(0, 0);
-        assert_eq!(xn, 0xB10C_F00D);
         let xn0 = extranonce1(0, 0);
         let xn1 = extranonce1(1, 0);
+        assert_eq!(xn0, 0xB10C_F00D);
         assert_eq!(xn1.wrapping_sub(xn0), 1u32 << 22);
     }
 
@@ -79,12 +103,16 @@ mod tests {
 
     #[test]
     fn build_response() {
-        let r = StratumResponse {
-            id: json!(1),
-            result: json!(true),
-            error: json!(null),
-        };
+        let r = StratumResponse::ok(json!(1), json!(true));
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"result\":true"));
+    }
+
+    #[test]
+    fn build_error_response() {
+        let r = StratumResponse::err(json!(42), 23, "stale work");
+        let s = serde_json::to_string(&r).unwrap();
+        assert!(s.contains("\"id\":42"));
+        assert!(s.contains("\"error\":[23,\"stale work\",null]"));
     }
 }

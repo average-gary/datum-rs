@@ -18,6 +18,8 @@ use axum::{Json, Router};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
+pub mod digest;
+
 pub trait MetricsSource: Send + Sync {
     fn snapshot(&self) -> Value;
 }
