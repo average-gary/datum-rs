@@ -83,21 +83,40 @@ impl Client {
     }
 
     /// Generic JSON-RPC call with cookie-reload-on-401 retry semantics
-    /// (matches datum_jsonrpc.c's `bitcoind_json_rpc_call`).
+    /// (matches datum_jsonrpc.c's `bitcoind_json_rpc_call`). Uses the
+    /// client's default timeout (5s).
     pub async fn call<T: for<'de> Deserialize<'de>>(
         &self,
         method: &str,
         params: Value,
     ) -> Result<T, RpcError> {
-        let resp_value = self.call_value(method, params).await?;
+        let resp_value = self.call_value(method, params, None).await?;
         Ok(serde_json::from_value(resp_value)?)
     }
 
-    async fn call_value(&self, method: &str, params: Value) -> Result<Value, RpcError> {
+    /// Like [`call`], but overrides the per-request timeout — necessary for
+    /// long-poll calls (`getblocktemplate` with `longpollid` set) which
+    /// bitcoind holds open up to ~60s waiting for tip changes.
+    pub async fn call_with_timeout<T: for<'de> Deserialize<'de>>(
+        &self,
+        method: &str,
+        params: Value,
+        timeout: Duration,
+    ) -> Result<T, RpcError> {
+        let resp_value = self.call_value(method, params, Some(timeout)).await?;
+        Ok(serde_json::from_value(resp_value)?)
+    }
+
+    async fn call_value(
+        &self,
+        method: &str,
+        params: Value,
+        per_call_timeout: Option<Duration>,
+    ) -> Result<Value, RpcError> {
         let userpass = self.userpass().await?;
         let body = self.request_body(method, &params);
 
-        let resp = self.http_call(&userpass, &body).await?;
+        let resp = self.http_call(&userpass, &body, per_call_timeout).await?;
         if let Some(value) = resp {
             return parse_rpc_response(value);
         }
@@ -105,7 +124,7 @@ impl Client {
         if matches!(*self.auth.read().await, Auth::Cookie(_)) {
             let _ = self.cached_userpass.write().await.take();
             let userpass = self.userpass().await?;
-            let resp = self.http_call(&userpass, &body).await?;
+            let resp = self.http_call(&userpass, &body, per_call_timeout).await?;
             if let Some(value) = resp {
                 return parse_rpc_response(value);
             }
@@ -114,16 +133,23 @@ impl Client {
         Err(RpcError::AuthFailed)
     }
 
-    async fn http_call(&self, userpass: &str, body: &str) -> Result<Option<Value>, RpcError> {
+    async fn http_call(
+        &self,
+        userpass: &str,
+        body: &str,
+        per_call_timeout: Option<Duration>,
+    ) -> Result<Option<Value>, RpcError> {
         let (user, pass) = split_userpass(userpass);
-        let response = self
+        let mut req = self
             .http
             .post(&self.url)
             .basic_auth(user, Some(pass))
             .header("Content-Type", "application/json")
-            .body(body.to_owned())
-            .send()
-            .await?;
+            .body(body.to_owned());
+        if let Some(t) = per_call_timeout {
+            req = req.timeout(t);
+        }
+        let response = req.send().await?;
 
         if response.status() == reqwest::StatusCode::UNAUTHORIZED {
             return Ok(None);

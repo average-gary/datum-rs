@@ -119,13 +119,19 @@ impl TemplatePuller {
         long_poll_id: Option<&str>,
     ) -> Result<Template, BlockTemplateError> {
         let rules: Vec<&str> = self.rules.iter().map(|s| s.as_str()).collect();
-        let value = self
-            .client
-            .call::<Value>(
-                "getblocktemplate",
-                Template::fetch_request(&rules, long_poll_id),
-            )
-            .await?;
+        let request = Template::fetch_request(&rules, long_poll_id);
+        // Long-poll requests block on bitcoind for up to ~60s waiting for tip
+        // changes; the default 5s client timeout is too short. Non-long-poll
+        // requests (initial fetch) return immediately and use the default.
+        let value = if long_poll_id.is_some() {
+            self.client
+                .call_with_timeout::<Value>("getblocktemplate", request, Duration::from_secs(75))
+                .await?
+        } else {
+            self.client
+                .call::<Value>("getblocktemplate", request)
+                .await?
+        };
         Ok(serde_json::from_value(value)?)
     }
 

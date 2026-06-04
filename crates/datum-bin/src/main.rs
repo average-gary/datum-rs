@@ -88,7 +88,8 @@ fn run(config_path: &PathBuf, git_sha: &str) -> ExitCode {
 }
 
 async fn run_async(cfg: Config) {
-    let _ = datum_logger::install_global("info");
+    let filter = std::env::var("DATUM_LOG").unwrap_or_else(|_| "info".to_string());
+    let _ = datum_logger::install_global(&filter);
     spawn_signal_handlers();
 
     let runtime = Arc::new(RuntimeStats::new());
