@@ -99,7 +99,7 @@ fn assemble_notify_produces_well_formed_json_array() {
 }
 
 #[test]
-fn coinbase_reconstruction_is_valid_bitcoin_tx() {
+fn coinbase_reconstruction_is_valid_legacy_bitcoin_tx() {
     let n = assemble_notify("j", &fixture_template(), &fixture_coinbaser(), b"", true);
     let mut full = hex::decode(&n.coinb1).unwrap();
     full.extend(vec![
@@ -109,36 +109,159 @@ fn coinbase_reconstruction_is_valid_bitcoin_tx() {
     full.extend(hex::decode(&n.coinb2).unwrap());
 
     assert_eq!(&full[0..4], &[0x01, 0x00, 0x00, 0x00], "version");
-    assert_eq!(full[4..6], [0x00, 0x01], "segwit marker+flag");
-    assert_eq!(full[6], 0x01, "tx_in_count = 1");
-    assert_eq!(&full[7..39], &[0u8; 32], "prev_hash zeroed for coinbase");
+    // SV1 mining.notify uses legacy serialization: tx_in_count immediately
+    // follows version, no segwit marker/flag.
+    assert_eq!(full[4], 0x01, "tx_in_count");
+    assert_eq!(&full[5..37], &[0u8; 32], "prev_hash zeroed for coinbase");
     assert_eq!(
-        u32::from_le_bytes(full[39..43].try_into().unwrap()),
+        u32::from_le_bytes(full[37..41].try_into().unwrap()),
         0xFFFFFFFF,
         "prev_idx 0xFFFFFFFF"
     );
     assert_eq!(&full[full.len() - 4..], &[0u8; 4], "locktime is 0");
 }
 
+/// Captured from a real `OCEAN-xyz/datum_gateway` (Docker C build) running
+/// against a regtest bitcoind on 2026-06-03. The C gateway was configured
+/// with:
+///   - `mining.pool_address` = `1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa` (P2PKH)
+///   - `coinbase_tag_primary` = `"datum-rs cap"`
+///   - `coinbase_tag_secondary` = `"T"`
+///   - `datum.pool_host` = `""`  (NON-POOLED MINING mode — uses
+///     mining.pool_address verbatim as the only output)
+///   - regtest height 102
+///
+/// Use this test to assert the **field shapes** our assembler matches today.
+/// Full byte-for-byte parity over coinb1/coinb2/merkle_branch is not yet
+/// achieved; the deltas are documented inline as TODOs and tracked in
+/// issue #2 under "datum-stratum-sv1 golden vectors".
 #[test]
-#[ignore = "needs c-mining-notify.txt fixture; see file-level docs"]
-fn mining_notify_matches_c_byte_for_byte() {
-    let fixture = include_str!("fixtures/c-mining-notify.txt");
+fn mining_notify_field_shapes_match_c_capture() {
+    let fixture = include_str!("fixtures/c-mining-notify.txt").trim();
     let c_value: Value = serde_json::from_str(fixture).expect("fixture is valid JSON");
     let c_params = c_value
         .get("params")
         .expect("c fixture has params field")
+        .as_array()
+        .expect("params is an array")
         .clone();
-    let n = assemble_notify(
+    assert_eq!(c_params.len(), 9, "C mining.notify params has 9 fields");
+
+    // Field shapes we should always match:
+    let c_job_id = c_params[0].as_str().unwrap();
+    assert_eq!(c_job_id.len(), 16, "C job_id is 16 hex chars (8 bytes)");
+    let c_prev_hash = c_params[1].as_str().unwrap();
+    assert_eq!(
+        c_prev_hash.len(),
+        64,
+        "C prev_hash is 64 hex chars (32 bytes)"
+    );
+    let c_coinb1 = c_params[2].as_str().unwrap();
+    let c_coinb2 = c_params[3].as_str().unwrap();
+    let c_merkle = c_params[4].as_array().unwrap();
+    let c_version = c_params[5].as_str().unwrap();
+    let c_nbits = c_params[6].as_str().unwrap();
+    let c_ntime = c_params[7].as_str().unwrap();
+    let c_clean = c_params[8].as_bool().unwrap();
+    assert_eq!(c_version.len(), 8);
+    assert_eq!(c_nbits.len(), 8);
+    assert_eq!(c_ntime.len(), 8);
+    assert!(c_clean, "C emits clean_jobs=true on the first notify");
+
+    // Coinbase legacy-serialization invariants we assert hold for the C
+    // fixture — and that our assembler also produces the same shape.
+    let c_coinb1_bytes = hex::decode(c_coinb1).unwrap();
+    assert_eq!(
+        &c_coinb1_bytes[0..4],
+        &[0x01, 0x00, 0x00, 0x00],
+        "C coinb1 starts with version=1 (LE)"
+    );
+    assert_eq!(
+        c_coinb1_bytes[4], 0x01,
+        "C coinb1: tx_in_count immediately after version (LEGACY serialization)"
+    );
+    assert_eq!(
+        &c_coinb1_bytes[5..37],
+        &[0u8; 32],
+        "C coinb1: prev_hash zeroed"
+    );
+    assert_eq!(
+        u32::from_le_bytes(c_coinb1_bytes[37..41].try_into().unwrap()),
+        0xFFFFFFFF,
+        "C coinb1: prev_idx 0xFFFFFFFF"
+    );
+
+    let c_coinb2_bytes = hex::decode(c_coinb2).unwrap();
+    assert_eq!(
+        &c_coinb2_bytes[c_coinb2_bytes.len() - 4..],
+        &[0u8; 4],
+        "C coinb2: locktime 0"
+    );
+
+    // merkle_branch is empty when the template has no transactions:
+    assert_eq!(
+        c_merkle.len(),
+        0,
+        "C captured fixture has empty merkle_branch (regtest tip with no txs)"
+    );
+
+    // Now run our assembler against a template with the SAME number of
+    // transactions and assert *our* output produces the same field shapes.
+    let our = assemble_notify(
         "0000000000000001",
         &fixture_template(),
         &fixture_coinbaser(),
         b"datum-rs bench",
         true,
     );
-    let our_params = n.to_json_array();
+    let our_params = our.to_json_array();
+    let our_arr = our_params.as_array().unwrap();
+    assert_eq!(our_arr.len(), 9);
+    let our_coinb1_bytes = hex::decode(our_arr[2].as_str().unwrap()).unwrap();
+    assert_eq!(&our_coinb1_bytes[0..4], &[0x01, 0x00, 0x00, 0x00]);
     assert_eq!(
-        our_params, c_params,
-        "assembler output must match C output byte-for-byte"
+        our_coinb1_bytes[4], 0x01,
+        "OUR coinb1 also legacy-serialized"
     );
+    let our_coinb2_bytes = hex::decode(our_arr[3].as_str().unwrap()).unwrap();
+    assert_eq!(&our_coinb2_bytes[our_coinb2_bytes.len() - 4..], &[0u8; 4]);
+}
+
+/// Pin the precise scriptsig structure the C reference emits at this height +
+/// tag combo. **Does not run today** — depends on assembler producing
+/// identical scriptsig bytes, which requires porting the C
+/// coinbase_unique_id injection + tag-len-prefixing logic. Tracking the
+/// remaining deltas:
+///
+/// 1. **Composite tag with secondary length-prefix**: C scriptsig embeds the
+///    primary tag, then a 1-byte length, then the secondary tag (e.g.
+///    `0f 646174756d2d7273206361700f54` decodes to length-15 push of
+///    `"datum-rs cap" + 0x0f + "T"`). Our assembler treats coinbase_tag as
+///    a single opaque byte slice — wrong shape.
+/// 2. **coinbase_unique_id injection**: a 3-byte LE-encoded ID derived from
+///    `coinbase_unique_id` config field gets injected after the extranonce
+///    placeholder. Not modeled in our assembler at all today.
+/// 3. **Trailing scriptsig bytes**: C captures show `b10d` as the very last
+///    bytes of scriptsig — origin not yet identified.
+///
+/// Removing the `#[ignore]` on this test is the **v0.1.0 mainnet-readiness
+/// gate**: until our scriptsig matches C byte-for-byte, mining shares
+/// against mainnet OCEAN risks coinbase-output divergence (operator pays
+/// self instead of OCEAN). Signet bench operation per BENCH_VALIDATION.md
+/// is safe today; mainnet is not.
+#[test]
+#[ignore = "scriptsig structure deltas (composite tag, unique_id injection); see file-level docs"]
+fn coinb1_byte_exact_against_c_capture() {
+    let fixture = include_str!("fixtures/c-mining-notify.txt").trim();
+    let c_value: Value = serde_json::from_str(fixture).unwrap();
+    let c_coinb1 = c_value["params"][2].as_str().unwrap();
+
+    let our = assemble_notify(
+        "0000000000000001",
+        &fixture_template(),
+        &fixture_coinbaser(),
+        b"datum-rs cap",
+        true,
+    );
+    assert_eq!(our.coinb1, c_coinb1);
 }

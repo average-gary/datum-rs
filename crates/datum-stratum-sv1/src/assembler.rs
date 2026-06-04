@@ -155,16 +155,23 @@ fn build_split_coinbase(
     coinbase_tag: &[u8],
     outputs_blob: &[u8],
 ) -> (String, String) {
+    // CRITICAL: Stratum V1 mining.notify uses LEGACY (non-segwit) coinbase
+    // serialization, even when the template targets a segwit-active chain.
+    // The witness commitment lives as a normal output in the outputs blob
+    // (handled by build_outputs); no marker/flag in the tx itself, no
+    // witness reserved value. Matched against C-emitted fixture in
+    // crates/datum-stratum-sv1/tests/fixtures/c-mining-notify.txt.
     let mut coinb1 = Vec::new();
     let mut coinb2 = Vec::new();
 
+    // version (4)
     coinb1.extend_from_slice(&1u32.to_le_bytes());
 
-    coinb1.push(0x00);
+    // tx_in_count (1)
     coinb1.push(0x01);
-
-    coinb1.push(0x01);
+    // prev_hash (32) — zero
     coinb1.extend_from_slice(&[0u8; 32]);
+    // prev_idx (4) — 0xFFFFFFFF
     coinb1.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
 
     let height_script = bip34_height_script(template.height);
@@ -172,15 +179,18 @@ fn build_split_coinbase(
     push_varint(&mut coinb1, scriptsig_len as u64);
     coinb1.extend_from_slice(&height_script);
 
+    // coinbase_tag goes after the extranonce placeholder; the placeholder
+    // is what splits coinb1 from coinb2. Bytes BEFORE the placeholder go
+    // in coinb1; bytes AFTER go in coinb2.
     coinb2.extend_from_slice(coinbase_tag);
+
+    // sequence (4)
     coinb2.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
 
+    // outputs (count + each output's value+script)
     coinb2.extend_from_slice(outputs_blob);
 
-    coinb2.push(0x01);
-    coinb2.push(0x20);
-    coinb2.extend_from_slice(&[0u8; 32]);
-
+    // locktime (4) — 0
     coinb2.extend_from_slice(&0u32.to_le_bytes());
 
     (hex::encode(coinb1), hex::encode(coinb2))
@@ -284,14 +294,17 @@ mod tests {
     }
 
     #[test]
-    fn coinb1_then_coinb2_decodes_as_full_coinbase() {
+    fn coinb1_then_coinb2_decodes_as_legacy_coinbase() {
         let n = assemble_notify("j", &template(), &p2pkh_blob(), b"", false);
         let mut full = hex::decode(&n.coinb1).unwrap();
         full.extend(vec![0u8; EXTRANONCE_PLACEHOLDER_LEN]);
         full.extend(hex::decode(&n.coinb2).unwrap());
         assert!(full.len() > 60);
-        assert_eq!(&full[0..4], &[0x01, 0x00, 0x00, 0x00]);
-        assert_eq!(full[4..6], [0x00, 0x01]);
+        assert_eq!(&full[0..4], &[0x01, 0x00, 0x00, 0x00], "version");
+        // Per Stratum V1 spec, mining.notify coinbase is LEGACY-serialized,
+        // so byte 4 is tx_in_count (0x01), NOT segwit marker (0x00).
+        assert_eq!(full[4], 0x01, "tx_in_count");
+        assert_eq!(&full[5..37], &[0u8; 32], "prev_hash zeroed");
     }
 
     #[test]

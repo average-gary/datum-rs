@@ -1,0 +1,9 @@
+2026-06-03 20:40:36.871 [                         datum_protocol_init]  WARN: ****************************************************
+2026-06-03 20:40:36.871 [                         datum_protocol_init]  WARN: *** DATUM pool host is blank. NON-POOLED MINING! ***
+2026-06-03 20:40:36.871 [                              datum_api_init]  INFO: INFO: No API port configured. API disabled.
+2026-06-03 20:40:36.872 [               datum_gateway_template_thread] FATAL: Could not generate output script for pool addr! Perhaps invalid? This is bad.
+2026-06-03 20:41:17.284 [               datum_gateway_template_thread]  INFO: NEW NETWORK BLOCK: 4c142d2f9c235f6ddba41375d3d57bc5c1adab64828caf2a54faeeaa9f7c19f3 (102)
+2026-06-03 20:41:17.319 [              datum_stratum_v1_socket_server]  INFO: Stratum V1 Server Init complete.
+2026-06-03 20:41:17.319 [              datum_stratum_v1_socket_server]  INFO: Empty work send completed. Sent to 0 clients across 0 threads
+2026-06-03 20:41:17.319 [               datum_gateway_listener_thread]  INFO: DATUM Socket listener thread active for 'Stratum V1 Server'
+2026-06-03 20:41:17.321 [               datum_gateway_template_thread]  INFO: Updating priority stratum job for block 102: 50.00000000 BTC, 0 txns, 0 bytes (Sent to 0 stratum clients)

@@ -10,15 +10,19 @@
 
 use std::sync::Arc;
 
-use axum::extract::State;
-use axum::http::StatusCode;
-use axum::response::IntoResponse;
+use axum::extract::{Path, State};
+use axum::http::{header, HeaderValue, StatusCode};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use include_dir::{include_dir, Dir};
+#[allow(unused_imports)]
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 pub mod digest;
+
+static WWW: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/www");
 
 pub trait MetricsSource: Send + Sync {
     fn snapshot(&self) -> Value;
@@ -31,36 +35,86 @@ pub struct ApiState {
 
 pub fn router(state: ApiState) -> Router {
     Router::new()
-        .route("/", get(root))
-        .route("/clients", get(clients))
-        .route("/threads", get(threads))
-        .route("/coinbaser", get(coinbaser))
-        .route("/config", get(config_get))
+        .route("/", get(root_html))
+        .route("/clients", get(clients_html))
+        .route("/threads", get(threads_html))
+        .route("/coinbaser", get(coinbaser_html))
+        .route("/config", get(config_html))
         .route("/cmd", post(cmd_post))
         .route("/NOTIFY", post(notify_post))
         .route("/testnet_fastforward", post(testnet_fastforward))
         .route("/umbrel-api", get(umbrel_api))
+        .route("/assets/*path", get(serve_asset))
+        .route("/api/metrics", get(metrics_json))
         .with_state(state)
 }
 
-async fn root(State(s): State<ApiState>) -> impl IntoResponse {
-    Json(json!({ "service": "datum_gateway", "metrics": s.metrics.snapshot() }))
+/// Returns the embedded HTML page for `name` (without `.html`), wrapping it in
+/// `home.html` + `foot.html` like the C gateway does.
+fn render_page(name: &str) -> Result<String, StatusCode> {
+    let page = WWW
+        .get_file(format!("{name}.html"))
+        .ok_or(StatusCode::NOT_FOUND)?;
+    let foot = WWW
+        .get_file("foot.html")
+        .map(|f| f.contents_utf8().unwrap_or(""))
+        .unwrap_or("");
+    let body = page
+        .contents_utf8()
+        .ok_or(StatusCode::INTERNAL_SERVER_ERROR)?;
+    Ok(format!("{body}{foot}"))
 }
 
-async fn clients(State(s): State<ApiState>) -> impl IntoResponse {
+async fn root_html() -> impl IntoResponse {
+    match render_page("home") {
+        Ok(html) => Html(html).into_response(),
+        Err(s) => s.into_response(),
+    }
+}
+
+async fn clients_html() -> impl IntoResponse {
+    match render_page("clients_top") {
+        Ok(html) => Html(html).into_response(),
+        Err(s) => s.into_response(),
+    }
+}
+
+async fn threads_html() -> impl IntoResponse {
+    match render_page("threads_top") {
+        Ok(html) => Html(html).into_response(),
+        Err(s) => s.into_response(),
+    }
+}
+
+async fn coinbaser_html() -> impl IntoResponse {
+    match render_page("coinbaser_top") {
+        Ok(html) => Html(html).into_response(),
+        Err(s) => s.into_response(),
+    }
+}
+
+async fn config_html() -> impl IntoResponse {
+    match render_page("config") {
+        Ok(html) => Html(html).into_response(),
+        Err(s) => s.into_response(),
+    }
+}
+
+async fn metrics_json(State(s): State<ApiState>) -> impl IntoResponse {
     Json(s.metrics.snapshot())
 }
 
-async fn threads(State(_s): State<ApiState>) -> impl IntoResponse {
-    Json(json!({ "threads": [] }))
-}
-
-async fn coinbaser(State(_s): State<ApiState>) -> impl IntoResponse {
-    Json(json!({ "outputs": [] }))
-}
-
-async fn config_get(State(_s): State<ApiState>) -> impl IntoResponse {
-    Json(json!({}))
+async fn serve_asset(Path(path): Path<String>) -> Response {
+    let lookup = format!("assets/{path}");
+    let Some(file) = WWW.get_file(&lookup) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    let mime = mime_guess::from_path(&lookup).first_or_octet_stream();
+    let mut response = (StatusCode::OK, file.contents().to_vec()).into_response();
+    if let Ok(value) = HeaderValue::from_str(mime.essence_str()) {
+        response.headers_mut().insert(header::CONTENT_TYPE, value);
+    }
+    response
 }
 
 async fn cmd_post() -> impl IntoResponse {
@@ -128,15 +182,48 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn root_returns_metrics() {
+    async fn root_returns_html() {
         let resp = app()
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
+        let s = std::str::from_utf8(&body).unwrap();
+        assert!(s.contains("<"));
+    }
+
+    #[tokio::test]
+    async fn metrics_json_endpoint_works() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/metrics")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = resp.into_body().collect().await.unwrap().to_bytes();
         let v: Value = serde_json::from_slice(&body).unwrap();
-        assert_eq!(v["service"], "datum_gateway");
+        assert_eq!(v["miner_count"], 0);
+    }
+
+    #[tokio::test]
+    async fn assets_css_is_served() {
+        let resp = app()
+            .oneshot(
+                Request::builder()
+                    .uri("/assets/style.css")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap();
+        assert!(ct.to_str().unwrap().contains("css"));
     }
 
     #[tokio::test]

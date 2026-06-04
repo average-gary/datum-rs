@@ -14,3 +14,8 @@ datum-dupes = { path = "../datum-dupes" }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+
+[dev-dependencies]
+datum-stratum-sv1 = { path = "../datum-stratum-sv1" }
+hex = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
