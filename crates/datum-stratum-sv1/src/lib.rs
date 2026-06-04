@@ -22,6 +22,8 @@ use thiserror::Error;
 pub mod assembler;
 pub mod server;
 
+pub use assembler::ScriptSigInputs;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StratumRequest {
     pub id: Value,

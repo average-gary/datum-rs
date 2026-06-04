@@ -227,41 +227,93 @@ fn mining_notify_field_shapes_match_c_capture() {
     assert_eq!(&our_coinb2_bytes[our_coinb2_bytes.len() - 4..], &[0u8; 4]);
 }
 
-/// Pin the precise scriptsig structure the C reference emits at this height +
-/// tag combo. **Does not run today** — depends on assembler producing
-/// identical scriptsig bytes, which requires porting the C
-/// coinbase_unique_id injection + tag-len-prefixing logic. Tracking the
-/// remaining deltas:
+/// Byte-exact coinb1 match against the captured C `mining.notify`.
+/// Closes the v0.1.0 mainnet-readiness gate by proving our assembler emits
+/// identical scriptsig bytes for the matched inputs.
 ///
-/// 1. **Composite tag with secondary length-prefix**: C scriptsig embeds the
-///    primary tag, then a 1-byte length, then the secondary tag (e.g.
-///    `0f 646174756d2d7273206361700f54` decodes to length-15 push of
-///    `"datum-rs cap" + 0x0f + "T"`). Our assembler treats coinbase_tag as
-///    a single opaque byte slice — wrong shape.
-/// 2. **coinbase_unique_id injection**: a 3-byte LE-encoded ID derived from
-///    `coinbase_unique_id` config field gets injected after the extranonce
-///    placeholder. Not modeled in our assembler at all today.
-/// 3. **Trailing scriptsig bytes**: C captures show `b10d` as the very last
-///    bytes of scriptsig — origin not yet identified.
-///
-/// Removing the `#[ignore]` on this test is the **v0.1.0 mainnet-readiness
-/// gate**: until our scriptsig matches C byte-for-byte, mining shares
-/// against mainnet OCEAN risks coinbase-output divergence (operator pays
-/// self instead of OCEAN). Signet bench operation per BENCH_VALIDATION.md
-/// is safe today; mainnet is not.
+/// The C fixture was captured with regtest height 102, NON-POOLED mode
+/// (only output is `mining.pool_address` taking the entire subsidy), no
+/// witness commitment (regtest tip with no transactions). We reproduce
+/// those exact inputs here.
 #[test]
-#[ignore = "scriptsig structure deltas (composite tag, unique_id injection); see file-level docs"]
 fn coinb1_byte_exact_against_c_capture() {
+    use datum_blocktemplates::Template;
+    use datum_coinbaser::{CoinbaseOutput, CoinbaserBlob};
+    use datum_stratum_sv1::assembler::{assemble_notify_with_scriptsig, ScriptSigInputs};
+
     let fixture = include_str!("fixtures/c-mining-notify.txt").trim();
     let c_value: Value = serde_json::from_str(fixture).unwrap();
     let c_coinb1 = c_value["params"][2].as_str().unwrap();
 
-    let our = assemble_notify(
-        "0000000000000001",
-        &fixture_template(),
-        &fixture_coinbaser(),
-        b"datum-rs cap",
+    // Match the C run inputs:
+    //   height=102, NON-POOLED (single output to pool_address P2PKH),
+    //   coinbase_tag_primary="datum-rs cap", secondary="T",
+    //   coinbase_unique_id=4242, enprefix=0x0db1 (from fixture),
+    //   pot_placeholder=0x03 (post-runtime-overwrite value in fixture).
+    //
+    // P2PKH script for 1A1zP1eP5QGefi2DMPTfTL5SLmv7DivfNa:
+    //   OP_DUP OP_HASH160 PUSH(20) <20-byte hash> OP_EQUALVERIFY OP_CHECKSIG
+    //   The 20-byte hash for that address is hex
+    //   `62e907b15cbf27d5425399ebf6f0fb50ebb88f18` (visible in c-mining-notify
+    //   coinb2). Total script: 25 bytes.
+    let p2pkh_hash = hex::decode("62e907b15cbf27d5425399ebf6f0fb50ebb88f18").unwrap();
+    let mut p2pkh_script = vec![0x76, 0xa9, 0x14];
+    p2pkh_script.extend_from_slice(&p2pkh_hash);
+    p2pkh_script.extend_from_slice(&[0x88, 0xac]);
+
+    // GBT-supplied default_witness_commitment captured from the same regtest
+    // run. Includes the OP_RETURN + 36-byte push opcodes:
+    //   6a 24 aa21a9ed <32-byte commitment>
+    let witness_commitment =
+        "6a24aa21a9ede2f61c3f71d1defd3fa999dfa36953755c690689799962b48bebd836974e8cf9";
+
+    let template = Template {
+        version: 0x2000_0000,
+        previous_block_hash: "00".repeat(32),
+        bits: "207fffff".into(),
+        height: 102,
+        coinbase_value: 5_000_000_000,
+        curtime: 0,
+        mintime: 0,
+        sizelimit: 4_000_000,
+        weightlimit: 4_000_000,
+        sigop_limit: 80_000,
+        default_witness_commitment: Some(witness_commitment.to_string()),
+        transactions: vec![],
+        long_poll_id: None,
+        target: None,
+    };
+    let coinbaser = CoinbaserBlob {
+        datum_id: 0,
+        outputs: vec![CoinbaseOutput {
+            value_sats: 5_000_000_000,
+            script_pubkey: p2pkh_script,
+        }],
+    };
+
+    let our = assemble_notify_with_scriptsig(
+        "j",
+        &template,
+        &coinbaser,
+        ScriptSigInputs {
+            coinbase_tag_primary: "datum-rs cap",
+            coinbase_tag_secondary: "T",
+            coinbase_unique_id: 4242,
+            enprefix: 0x0db1,
+            pot_placeholder: 0x03,
+        },
         true,
     );
-    assert_eq!(our.coinb1, c_coinb1);
+    assert_eq!(
+        our.coinb1, c_coinb1,
+        "assembler coinb1 must match C byte-for-byte"
+    );
+
+    // coinb2 must also match — it carries the operator's payout output
+    // verbatim. Mismatch here = operator pays self instead of OCEAN.
+    let c_coinb2 = c_value["params"][3].as_str().unwrap();
+    assert_eq!(
+        our.coinb2, c_coinb2,
+        "assembler coinb2 must match C byte-for-byte (catastrophic-if-violated)"
+    );
 }

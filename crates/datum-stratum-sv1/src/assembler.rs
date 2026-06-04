@@ -42,7 +42,46 @@ use datum_blocktemplates::Template;
 use datum_coinbaser::CoinbaserBlob;
 use serde_json::{json, Value};
 
-pub const EXTRANONCE_PLACEHOLDER_LEN: usize = 8;
+/// Total extranonce bytes the miner fills in: extranonce1 (4) + extranonce2 (4)
+/// matches `extranonce1` returned in `mining.subscribe` (8 hex chars). Plus the
+/// 2-byte `enprefix` written by the gateway right before the placeholder makes
+/// the total `OP_PUSHBYTES 14`-payload region 14 bytes wide on the wire — but
+/// only 12 of those bytes are "the placeholder" the miner fills.
+pub const EXTRANONCE_PLACEHOLDER_LEN: usize = 12;
+
+/// Bytes the gateway writes before the extranonce placeholder (the 2-byte
+/// `enprefix` from `datum_coinbaser.c:392-395`). They go inside the same
+/// `OP_PUSHBYTES 14` block in scriptsig, BEFORE the 12-byte placeholder.
+pub const ENPREFIX_LEN: usize = 2;
+
+/// Inputs for the scriptsig portion of the coinbase tx — directly maps to the
+/// configurable fields in `datum_conf.c`.
+#[derive(Debug, Clone)]
+pub struct ScriptSigInputs<'a> {
+    pub coinbase_tag_primary: &'a str,
+    pub coinbase_tag_secondary: &'a str,
+    /// Per-instance unique identifier (`coinbase_unique_id` in
+    /// `datum_conf.c`). Encoded as 2 LE bytes inside the uid push.
+    pub coinbase_unique_id: u16,
+    /// Per-job 2-byte extranonce prefix (`enprefix` in `datum_coinbaser.c`).
+    /// The gateway picks this; we accept it from the runtime.
+    pub enprefix: u16,
+    /// PoT placeholder byte. C writes 0xFF and overwrites later when the
+    /// vardiff target is known. We mirror that — runtime patches the byte.
+    pub pot_placeholder: u8,
+}
+
+impl Default for ScriptSigInputs<'_> {
+    fn default() -> Self {
+        Self {
+            coinbase_tag_primary: "DATUM Gateway",
+            coinbase_tag_secondary: "DATUM User",
+            coinbase_unique_id: 4242,
+            enprefix: 0,
+            pot_placeholder: 0xFF,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct NotifyParams {
@@ -73,11 +112,13 @@ impl NotifyParams {
     }
 }
 
-/// Assemble `mining.notify` params from a template + coinbaser blob.
+/// Assemble `mining.notify` params from a template + coinbaser blob, with
+/// scriptsig layout matching `datum_coinbaser.c::generate_coinbase_input`
+/// byte-for-byte.
 ///
-/// `job_id` is whatever the runtime wants to use for tracking (typically a
-/// monotonic counter, hex-encoded). `coinbase_tag` is appended to scriptSig
-/// after the BIP34 height + extranonce placeholder; pass empty for none.
+/// Convenience wrapper around [`assemble_notify_with_scriptsig`] using the
+/// default scriptsig defaults (matches C `coinbase_tag_primary`,
+/// `coinbase_tag_secondary`, `coinbase_unique_id` defaults).
 pub fn assemble_notify(
     job_id: &str,
     template: &Template,
@@ -85,8 +126,31 @@ pub fn assemble_notify(
     coinbase_tag: &[u8],
     clean_jobs: bool,
 ) -> NotifyParams {
+    let primary = std::str::from_utf8(coinbase_tag).unwrap_or("DATUM Gateway");
+    assemble_notify_with_scriptsig(
+        job_id,
+        template,
+        coinbaser,
+        ScriptSigInputs {
+            coinbase_tag_primary: primary,
+            coinbase_tag_secondary: "DATUM User",
+            ..ScriptSigInputs::default()
+        },
+        clean_jobs,
+    )
+}
+
+/// Full-fidelity entry point. Produces `mining.notify` params using the exact
+/// scriptsig layout the C gateway emits.
+pub fn assemble_notify_with_scriptsig(
+    job_id: &str,
+    template: &Template,
+    coinbaser: &CoinbaserBlob,
+    scriptsig: ScriptSigInputs<'_>,
+    clean_jobs: bool,
+) -> NotifyParams {
     let coinbase_tx_outputs = build_outputs(template, coinbaser);
-    let (coinb1, coinb2) = build_split_coinbase(template, coinbase_tag, &coinbase_tx_outputs);
+    let (coinb1, coinb2) = build_split_coinbase(template, &scriptsig, &coinbase_tx_outputs);
     let merkle_branch = build_merkle_branch(template);
 
     let prev_hash = swap_prev_hash_for_stratum(&template.previous_block_hash);
@@ -152,21 +216,27 @@ fn build_outputs(template: &Template, coinbaser: &CoinbaserBlob) -> Vec<u8> {
 
 fn build_split_coinbase(
     template: &Template,
-    coinbase_tag: &[u8],
+    scriptsig: &ScriptSigInputs<'_>,
     outputs_blob: &[u8],
 ) -> (String, String) {
     // CRITICAL: Stratum V1 mining.notify uses LEGACY (non-segwit) coinbase
-    // serialization, even when the template targets a segwit-active chain.
-    // The witness commitment lives as a normal output in the outputs blob
-    // (handled by build_outputs); no marker/flag in the tx itself, no
-    // witness reserved value. Matched against C-emitted fixture in
-    // crates/datum-stratum-sv1/tests/fixtures/c-mining-notify.txt.
+    // serialization. The witness commitment lives as a normal output in the
+    // outputs blob (handled by build_outputs); no marker/flag in the tx
+    // itself, no witness reserved value. Matched against C-emitted fixture
+    // in crates/datum-stratum-sv1/tests/fixtures/c-mining-notify.txt.
+    //
+    // ScriptSig layout per `datum_coinbaser.c::generate_coinbase_input`:
+    //   [BIP34 height push] [tag block push] [uid push (PoT + uid LE)]
+    //   [enprefix push: 0x0E + 2-byte enprefix + 12-byte placeholder]
+    //
+    // Total scriptsig bytes (the varint length-prefix counts ALL of these):
+    //   height_script.len() + tag_block_with_push.len() + uid_block.len()
+    //   + 1 + 2 + 12.
     let mut coinb1 = Vec::new();
     let mut coinb2 = Vec::new();
 
     // version (4)
     coinb1.extend_from_slice(&1u32.to_le_bytes());
-
     // tx_in_count (1)
     coinb1.push(0x01);
     // prev_hash (32) — zero
@@ -175,32 +245,51 @@ fn build_split_coinbase(
     coinb1.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
 
     let height_script = bip34_height_script(template.height);
-    let scriptsig_len = height_script.len() + EXTRANONCE_PLACEHOLDER_LEN + coinbase_tag.len();
+    let tag_block = build_tag_push_block(
+        scriptsig.coinbase_tag_primary,
+        scriptsig.coinbase_tag_secondary,
+    );
+    let uid_block = build_uid_push_block(scriptsig.pot_placeholder, scriptsig.coinbase_unique_id);
+
+    // 0x0E push prefix + 2-byte enprefix + 12-byte placeholder = 15 bytes
+    let scriptsig_len = height_script.len()
+        + tag_block.len()
+        + uid_block.len()
+        + 1
+        + ENPREFIX_LEN
+        + EXTRANONCE_PLACEHOLDER_LEN;
     push_varint(&mut coinb1, scriptsig_len as u64);
     coinb1.extend_from_slice(&height_script);
+    coinb1.extend_from_slice(&tag_block);
+    coinb1.extend_from_slice(&uid_block);
+    coinb1.push(0x0E);
+    coinb1.extend_from_slice(&scriptsig.enprefix.to_le_bytes());
 
-    // coinbase_tag goes after the extranonce placeholder; the placeholder
-    // is what splits coinb1 from coinb2. Bytes BEFORE the placeholder go
-    // in coinb1; bytes AFTER go in coinb2.
-    coinb2.extend_from_slice(coinbase_tag);
+    // PLACEHOLDER (12 bytes): split point. coinb1 ends here; coinb2 begins.
 
     // sequence (4)
     coinb2.extend_from_slice(&0xFFFFFFFFu32.to_le_bytes());
-
-    // outputs (count + each output's value+script)
+    // outputs
     coinb2.extend_from_slice(outputs_blob);
-
-    // locktime (4) — 0
+    // locktime (4)
     coinb2.extend_from_slice(&0u32.to_le_bytes());
 
     (hex::encode(coinb1), hex::encode(coinb2))
 }
 
-/// BIP34 coinbase scriptSig height encoding: a minimal-length CScriptNum push.
+/// BIP34 coinbase scriptSig height encoding via the C reference's
+/// `append_UNum_hex` algorithm: count significant bytes; if MSB is set, append
+/// a zero byte to keep the value unsigned (BIP34 minimal CScriptNum-ish).
 fn bip34_height_script(height: u32) -> Vec<u8> {
-    let mut bytes = height.to_le_bytes().to_vec();
-    while bytes.len() > 1 && *bytes.last().unwrap() == 0 {
-        bytes.pop();
+    let mut bytes: Vec<u8> = Vec::new();
+    let mut n = height;
+    if n == 0 {
+        bytes.push(0);
+    } else {
+        while n != 0 {
+            bytes.push((n & 0xFF) as u8);
+            n >>= 8;
+        }
     }
     if let Some(&last) = bytes.last() {
         if last & 0x80 != 0 {
@@ -211,6 +300,60 @@ fn bip34_height_script(height: u32) -> Vec<u8> {
     out.push(bytes.len() as u8);
     out.extend_from_slice(&bytes);
     out
+}
+
+/// Build the tag-push block. Per `datum_coinbaser.c:75-159`: combined size
+/// `k = primary.len() + secondary.len() + 2` (two separator bytes); push
+/// prefix is single-byte if k ≤ 75 else `0x4C` + length byte. Body is
+/// `primary + 0x0F + secondary + 0x00` if both non-empty; just `primary +
+/// 0x00` if no secondary; etc.
+fn build_tag_push_block(primary: &str, secondary: &str) -> Vec<u8> {
+    let p = primary.as_bytes();
+    let s = secondary.as_bytes();
+    let mut body = Vec::new();
+    if !p.is_empty() {
+        body.extend_from_slice(p);
+        if s.is_empty() {
+            body.push(0x00);
+        } else {
+            body.push(0x0F);
+        }
+    } else if !s.is_empty() {
+        body.push(0x0F);
+    }
+    if !s.is_empty() {
+        body.extend_from_slice(s);
+        body.push(0x00);
+    }
+
+    let mut out = Vec::new();
+    if body.is_empty() {
+        // C reference fallback: push a NUL byte to avoid parsing the UID
+        // as a pool name.
+        out.push(0x01);
+        out.push(0x00);
+        return out;
+    }
+    let k = body.len();
+    if k <= 75 {
+        out.push(k as u8);
+    } else {
+        out.push(0x4C);
+        out.push(k as u8);
+    }
+    out.extend_from_slice(&body);
+    out
+}
+
+/// Build the unique-id push block. Per `datum_coinbaser.c:162-167` (no
+/// DATUM-active path): push 3 bytes = `[pot_placeholder][unique_id_lo][unique_id_hi]`.
+fn build_uid_push_block(pot_placeholder: u8, unique_id: u16) -> Vec<u8> {
+    vec![
+        0x03,
+        pot_placeholder,
+        (unique_id & 0xFF) as u8,
+        ((unique_id >> 8) & 0xFF) as u8,
+    ]
 }
 
 fn push_varint(buf: &mut Vec<u8>, n: u64) {
@@ -305,6 +448,69 @@ mod tests {
         // so byte 4 is tx_in_count (0x01), NOT segwit marker (0x00).
         assert_eq!(full[4], 0x01, "tx_in_count");
         assert_eq!(&full[5..37], &[0u8; 32], "prev_hash zeroed");
+    }
+
+    #[test]
+    fn scriptsig_matches_c_layout_for_known_inputs() {
+        // From the captured C fixture (regtest height 102, primary="datum-rs cap",
+        // secondary="T", coinbase_unique_id=4242, enprefix=0x0db1, pot_placeholder
+        // overwritten to 0x03 by C runtime): scriptsig (37 bytes) =
+        //   01 66                                      height push
+        //   0f 64 61 74 75 6d 2d 72 73 20 63 61 70 0f 54 00   tag block (15 + 1)
+        //   03 03 92 10                                uid push (PoT=0x03, uid=4242 LE)
+        //   0e b1 0d                                   enprefix push prefix + 2-byte enprefix
+        //   <12-byte placeholder>
+        //
+        // We assemble with pot_placeholder=0x03 to match the *post-PoT-overwrite*
+        // bytes in the fixture (the C source writes 0xFF and patches it later).
+        let n = assemble_notify_with_scriptsig(
+            "j",
+            &Template {
+                version: 0x2000_0000,
+                previous_block_hash: "00".repeat(32),
+                bits: "207fffff".into(),
+                height: 102,
+                coinbase_value: 5_000_000_000,
+                curtime: 0,
+                mintime: 0,
+                sizelimit: 4_000_000,
+                weightlimit: 4_000_000,
+                sigop_limit: 80_000,
+                default_witness_commitment: None,
+                transactions: vec![],
+                long_poll_id: None,
+                target: None,
+            },
+            &CoinbaserBlob {
+                datum_id: 0,
+                outputs: vec![],
+            },
+            ScriptSigInputs {
+                coinbase_tag_primary: "datum-rs cap",
+                coinbase_tag_secondary: "T",
+                coinbase_unique_id: 4242,
+                enprefix: 0x0db1,
+                pot_placeholder: 0x03,
+            },
+            true,
+        );
+        let coinb1 = hex::decode(&n.coinb1).unwrap();
+        // After version(4) + tx_in_count(1) + prev_hash(32) + prev_idx(4) = 41
+        // bytes, the scriptsig length varint and bytes follow.
+        let scriptsig_len = coinb1[41] as usize;
+        assert_eq!(scriptsig_len, 37, "C-equivalent scriptsig is 37 bytes");
+        let ss = &coinb1[42..];
+        // height push
+        assert_eq!(&ss[0..2], &[0x01, 0x66]);
+        // tag push: 0x0f + "datum-rs cap" + 0x0f + "T" + 0x00
+        let expected_tag = b"\x0fdatum-rs cap\x0fT\x00";
+        assert_eq!(&ss[2..2 + expected_tag.len()], expected_tag);
+        // uid push: 03 03 92 10
+        let after_tag = 2 + expected_tag.len();
+        assert_eq!(&ss[after_tag..after_tag + 4], &[0x03, 0x03, 0x92, 0x10]);
+        // enprefix push prefix + 2-byte enprefix: 0e b1 0d
+        let after_uid = after_tag + 4;
+        assert_eq!(&ss[after_uid..after_uid + 3], &[0x0e, 0xb1, 0x0d]);
     }
 
     #[test]
