@@ -12,8 +12,13 @@ share to OCEAN beta through `datum-rs`. This is the bench test that turns
 - Local `bitcoind` running. **Yes, this is required** — the DATUM model is
   miner-side template construction, so `datum-rs` calls `getblocktemplate`
   against your local node and ships the result to your miner. There is no
-  way to skip the local node. **Signet is the easy path** for first run:
-  ~5 GB disk, ~1 hour sync, OCEAN beta accepts signet shares.
+  way to skip the local node.
+  - **Mainnet bitcoind**: the documented happy path. Real BTC at stake. ~700
+    GB disk, ~1-2 weeks initial sync (or already synced).
+  - **Signet bitcoind**: optional dry-run alternative (~5 GB, ~1 hour sync,
+    OCEAN beta accepts signet shares). Only useful if you want to validate
+    the operator-side workflow without committing real hashrate against
+    mainnet difficulty for testing.
 - Network egress to `datum-beta1.mine.ocean.xyz:28915`. The handshake
   probe (`./target/release/handshake_probe`) is the cheap pre-flight.
 - A Bitcoin payout address you control, on the same network (signet /
@@ -27,17 +32,24 @@ What this bench proves:
   template puller → assembler → SV1 server → miner → submit → DATUM
   upstream → OCEAN credits.
 - The handshake, encryption, message codecs, and obfuscation chain match
-  what OCEAN expects (already confirmed by the live `handshake_probe`).
+  what OCEAN expects (confirmed by the live `handshake_probe`).
+- Byte-for-byte coinbase parity (`coinb1` + `coinb2`) with the C gateway,
+  pinned via captured fixture in
+  `crates/datum-stratum-sv1/tests/fixtures/c-mining-notify.txt`. Closes the
+  catastrophic-if-violated risk that an operator pays themselves instead
+  of OCEAN.
+- Proper Stratum V1 merkle branch computation (sibling-path of the
+  phantom coinbase position). Verified for 0/1/3/4-tx templates; mainnet
+  templates with hundreds of transactions exercise the same algorithm.
 
 What this bench **does not** prove:
-- Byte-for-byte coinbase parity with the C gateway. The assembler in
-  `datum-stratum-sv1::assembler` produces structurally valid SV1
-  `mining.notify` params, but Phase C's byte-fixture diff against a
-  running C gateway is still pending. **Real-money mainnet operation is
-  hard-gated on Phase C closing**: get coinbase wrong and the operator
-  pays themselves, not OCEAN. Bench on signet first; do not point this at
-  mainnet until the cross-protocol golden-vector test pins the assembler
-  output against a known-good C output.
+- Performance under sustained load (vardiff cadence, many concurrent
+  miners, prolonged uptime). The 1.2 TH/s single-miner case is well
+  inside the runtime's structural envelope; multi-miner behavior is
+  untested.
+- Block submission against bitcoind on a real block-found event. Code is
+  there (`datum-submitblock`) but no real block has been submitted by
+  this binary yet.
 
 ## Pre-flight
 
@@ -53,31 +65,33 @@ the network/firewall/DNS issue before proceeding.
 
 ## Setup
 
-### 1. Bitcoind on signet
+### 1. Bitcoind on mainnet
+
+If you don't already have a synced mainnet node, this step takes ~1-2
+weeks of wall-clock plus ~700 GB disk. Once synced:
 
 ```toml
 # ~/.bitcoin/bitcoin.conf
-signet=1
 server=1
-
-[signet]
 rpcuser=miner
 rpcpassword=changeme
-rpcport=38332
+rpcport=8332
 ```
 
 Start it:
 
 ```sh
 bitcoind -daemon
-# or the non-daemon equivalent for your launchd/systemd/whatever
 ```
 
-Wait for sync (~1 hour). Verify:
+Verify:
 
 ```sh
 bitcoin-cli getblockchaininfo | jq .blocks
 ```
+
+(Optional: signet alternative — change `bitcoin.conf` to `signet=1` and
+`rpcport=38332`. Adjust the `datum-rs` config's `rpcurl` accordingly.)
 
 ### 2. datum-rs config
 
@@ -86,7 +100,7 @@ Save to `~/datum-rs-bench.json`:
 ```json
 {
   "bitcoind": {
-    "rpcurl": "http://127.0.0.1:38332/",
+    "rpcurl": "http://127.0.0.1:8332/",
     "rpcuser": "miner",
     "rpcpassword": "changeme",
     "work_update_seconds": 40
@@ -95,7 +109,7 @@ Save to `~/datum-rs-bench.json`:
     "listen_port": 23334
   },
   "mining": {
-    "pool_address": "<your-signet-bitcoin-address>",
+    "pool_address": "<your-mainnet-bitcoin-address>",
     "coinbase_tag_primary": "datum-rs bench"
   },
   "api": {
@@ -110,7 +124,7 @@ Save to `~/datum-rs-bench.json`:
 }
 ```
 
-Replace `<your-signet-bitcoin-address>` with an address you control. This
+Replace `<your-mainnet-bitcoin-address>` with an address you control. This
 is what OCEAN credits.
 
 Validate the config:
@@ -131,7 +145,7 @@ Expected log lines, in order:
 
 ```
 INFO: sv1 stratum listener bound  sv1_addr=0.0.0.0:23334
-INFO: datum-rpc client constructed  rpcurl=http://127.0.0.1:38332/
+INFO: datum-rpc client constructed  rpcurl=http://127.0.0.1:8332/
 INFO: datum_gateway: HTTP API binding  api_addr=0.0.0.0:7152
 INFO: DATUM upstream: connecting  endpoint=datum-beta1.mine.ocean.xyz:28915
 INFO: DATUM handshake complete  motd="DATUM Prime - v0.3.2 - ..."
