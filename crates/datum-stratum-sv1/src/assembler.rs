@@ -371,20 +371,107 @@ fn push_varint(buf: &mut Vec<u8>, n: u64) {
     }
 }
 
-/// Merkle branch from the template's transactions list. SV1 expects each
-/// branch element as 64-hex (little-endian double-SHA256 hashes).
+/// Merkle branch computation per Stratum V1 spec, ported from
+/// `datum_stratum.c::stratum_calculate_merkle_branches`.
 ///
-/// **Phase B status**: returns the txid list verbatim (one branch per tx).
-/// This is structurally valid for a coinbase-at-position-0 merkle proof in
-/// an absolute sense but **NOT correct for shares**: the proper SV1 merkle
-/// branch is a logarithmic-depth path of sibling hashes, not the full list.
-/// Phase C closes this with byte-fixture validation.
+/// The miner computes the merkle root by:
+///   `root = combine(combine(combine(coinbase_hash, branch[0]), branch[1]), …)`
+/// where `combine(a, b) = double_sha256(a || b)`. So `branch` is the
+/// sibling-path of the coinbase position (always position 0).
+///
+/// Returns hex strings in BIG-ENDIAN byte order (txid display order, NOT
+/// internal-byte order — matches what the C gateway emits in `mining.notify`).
 fn build_merkle_branch(template: &Template) -> Vec<String> {
-    template
+    if template.transactions.is_empty() {
+        return Vec::new();
+    }
+
+    // Each transaction's `txid` is in big-endian display hex; flip to little-
+    // endian internal byte order for tree computation.
+    let mut current_level: Vec<[u8; 32]> = template
         .transactions
         .iter()
-        .map(|t| t.txid.clone())
+        .map(|t| {
+            let mut b = hex::decode(&t.txid).unwrap_or_else(|_| vec![0u8; 32]);
+            b.reverse();
+            let mut a = [0u8; 32];
+            if b.len() == 32 {
+                a.copy_from_slice(&b);
+            }
+            a
+        })
+        .collect();
+
+    let mut branch: Vec<[u8; 32]> = Vec::new();
+    // First branch element: txn[0] is the sibling of the (yet-unknown)
+    // coinbase tx at the leaf level.
+    branch.push(current_level[0]);
+
+    // Mirror the C loop exactly. effective size = current_level.len() + 1
+    // (phantom coinbase). When effective size > 1, halve (with odd-dup)
+    // until size 1.
+    let mut effective_size = current_level.len() + 1;
+    while effective_size > 1 {
+        let dup_last = effective_size % 2 != 0;
+        let padded_size = if dup_last {
+            effective_size + 1
+        } else {
+            effective_size
+        };
+        let next_size = padded_size / 2;
+
+        let mut next_level: Vec<[u8; 32]> = Vec::with_capacity(next_size);
+        for i in 0..next_size {
+            if i == 0 {
+                // Pair (phantom_coinbase, current_level[0]).
+                // Output unknown until miner provides coinbase.
+                next_level.push([0u8; 32]);
+            } else {
+                // Pair (current_level[2i-1], current_level[2i]). Index
+                // arithmetic shifted by 1 because phantom occupies index 0.
+                let left = current_level[(i * 2) - 1];
+                let right_idx = i * 2;
+                // If right is in-range use it; otherwise duplicate left (the
+                // C reference does this when level_size is odd and we're at
+                // the last pair).
+                let right = if right_idx < current_level.len() {
+                    current_level[right_idx]
+                } else {
+                    debug_assert!(dup_last, "out-of-range right but no dup_last");
+                    current_level[(i * 2) - 1]
+                };
+                let mut combined = [0u8; 64];
+                combined[..32].copy_from_slice(&left);
+                combined[32..].copy_from_slice(&right);
+                next_level.push(double_sha256(&combined));
+            }
+        }
+
+        if next_size > 1 {
+            branch.push(next_level[1]);
+        }
+        current_level = next_level;
+        effective_size = next_size;
+    }
+
+    branch
+        .into_iter()
+        .map(|h| {
+            let mut be = h;
+            be.reverse();
+            hex::encode(be)
+        })
         .collect()
+}
+
+fn double_sha256(input: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    let mut h = Sha256::new();
+    h.update(input);
+    let first: [u8; 32] = h.finalize().into();
+    let mut h2 = Sha256::new();
+    h2.update(first);
+    h2.finalize().into()
 }
 
 #[cfg(test)]
@@ -561,5 +648,88 @@ mod tests {
         let n = assemble_notify("j", &t, &p2pkh_blob(), b"", false);
         let coinb2_bytes = hex::decode(&n.coinb2).unwrap();
         assert!(coinb2_bytes.len() > p2pkh_blob().outputs[0].script_pubkey.len() + 38);
+    }
+
+    #[test]
+    fn merkle_branch_empty_for_no_transactions() {
+        let n = assemble_notify("j", &template(), &p2pkh_blob(), b"", false);
+        assert_eq!(n.merkle_branch.len(), 0);
+    }
+
+    #[test]
+    fn merkle_branch_single_tx_returns_just_that_tx() {
+        use datum_blocktemplates::TemplateTransaction;
+        let mut t = template();
+        t.transactions = vec![TemplateTransaction {
+            data: "00".into(),
+            txid: "11".repeat(32),
+            hash: "11".repeat(32),
+            fee: 0,
+            sigops: 0,
+            weight: 0,
+            depends: vec![],
+        }];
+        let n = assemble_notify("j", &t, &p2pkh_blob(), b"", false);
+        // Single tx: the only pair is (coinbase, tx[0]); branch = [tx[0]].
+        assert_eq!(n.merkle_branch.len(), 1);
+        assert_eq!(n.merkle_branch[0], "11".repeat(32));
+    }
+
+    #[test]
+    fn merkle_branch_grows_logarithmically() {
+        use datum_blocktemplates::TemplateTransaction;
+        let mut t = template();
+        // 4 transactions + 1 phantom coinbase = 5 leaves; branch length =
+        // ceil(log2(5)) = 3 levels.
+        t.transactions = (0..4u8)
+            .map(|i| TemplateTransaction {
+                data: "00".into(),
+                txid: format!("{i:02x}").repeat(32),
+                hash: format!("{i:02x}").repeat(32),
+                fee: 0,
+                sigops: 0,
+                weight: 0,
+                depends: vec![],
+            })
+            .collect();
+        let n = assemble_notify("j", &t, &p2pkh_blob(), b"", false);
+        assert_eq!(
+            n.merkle_branch.len(),
+            3,
+            "ceil(log2(N+1)) = 3 for N=4 transactions"
+        );
+        // First branch element is always tx[0] in display order:
+        assert_eq!(n.merkle_branch[0], "00".repeat(32));
+    }
+
+    #[test]
+    fn merkle_branch_three_txs_branch_len_2() {
+        use datum_blocktemplates::TemplateTransaction;
+        let mut t = template();
+        // 3 transactions + 1 phantom = 4 leaves; branch length = 2.
+        t.transactions = (0..3u8)
+            .map(|i| TemplateTransaction {
+                data: "00".into(),
+                txid: format!("{i:02x}").repeat(32),
+                hash: format!("{i:02x}").repeat(32),
+                fee: 0,
+                sigops: 0,
+                weight: 0,
+                depends: vec![],
+            })
+            .collect();
+        let n = assemble_notify("j", &t, &p2pkh_blob(), b"", false);
+        assert_eq!(n.merkle_branch.len(), 2);
+    }
+
+    #[test]
+    fn double_sha256_known_vector() {
+        // Bitcoin block 0 merkle root double-SHA256 well-known input.
+        // Empty input double-SHA256 = sha256("") double-hashed.
+        let h = double_sha256(b"");
+        assert_eq!(
+            hex::encode(h),
+            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"
+        );
     }
 }
