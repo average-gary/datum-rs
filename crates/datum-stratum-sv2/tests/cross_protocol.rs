@@ -75,21 +75,15 @@ fn sv1_and_sv2_pay_identical_satoshis_to_identical_scripts() {
     let notify = assemble_notify("job-1", &template(), &blob, b"datum-rs", true);
     let coinb2_bytes = hex::decode(&notify.coinb2).unwrap();
 
-    // Parse the outputs blob from coinb2. Layout (after coinbase_tag bytes
-    // consumed before extranonce + sequence):
+    // Parse the outputs blob from coinb2. Per current assembler layout:
     //   sequence(4) | output_count(varint) | [value(8) + scriptlen(varint) + script]…
     //   | locktime(4)
     //
-    // For this fixture coinbase_tag is "datum-rs" (8 bytes); extranonce
-    // placeholder is in coinb1. coinb2 begins with the rest of the
-    // coinbase_tag bytes (in our assembler this is *all* the tag bytes
-    // since we put the placeholder before the tag in coinb1) + sequence.
-    // Easier: skip the coinbase_tag prefix + 4-byte sequence (always
-    // 0xFFFFFFFF) and walk the outputs.
-    let tag_len = b"datum-rs".len();
-    let mut idx = tag_len + 4;
+    // The coinbase_tag now lives inside scriptsig (in coinb1), not at the
+    // start of coinb2. coinb2 begins directly with sequence.
+    let mut idx = 4;
     assert_eq!(
-        u32::from_le_bytes(coinb2_bytes[tag_len..idx].try_into().unwrap()),
+        u32::from_le_bytes(coinb2_bytes[..4].try_into().unwrap()),
         0xFFFFFFFF,
         "sequence is 0xFFFFFFFF"
     );
