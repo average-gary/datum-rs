@@ -115,6 +115,11 @@ async fn run_async(cfg: Config) {
     // and clients block until the gateway gets real templates.
     let (notify_tx, notify_rx) =
         tokio::sync::watch::channel::<Option<datum_stratum_sv1::server::NotifyJob>>(None);
+    // Pool-supplied vardiff floor. Updated whenever ClientConfig arrives from
+    // the upstream. SV1 server clamps every miner's current_diff to
+    // max(local_min, pool_min) so shares never land below the pool's minimum
+    // (which would all reject as DATUM_REJECT_BAD_TARGET).
+    let (pool_min_diff_tx, pool_min_diff_rx) = tokio::sync::watch::channel::<u64>(0);
     let (sv1_shutdown_tx, sv1_shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
     let (submit_tx, mut submit_rx) =
         tokio::sync::mpsc::channel::<datum_stratum_sv1::server::SubmittedShare>(64);
@@ -131,9 +136,10 @@ async fn run_async(cfg: Config) {
         recheck_secs: 30,
         max: 1u64 << 40,
     };
-    let sv1_state = datum_stratum_sv1::server::ServerState::new(notify_rx)
-        .with_submit_tx(submit_tx.clone())
-        .with_vardiff(vardiff_params);
+    let sv1_state =
+        datum_stratum_sv1::server::ServerState::new(notify_rx, pool_min_diff_rx.clone())
+            .with_submit_tx(submit_tx.clone())
+            .with_vardiff(vardiff_params);
 
     let sv1_handle = match tokio::net::TcpListener::bind(sv1_addr).await {
         Ok(listener) => {
@@ -362,6 +368,7 @@ async fn run_async(cfg: Config) {
         let template_ch_for_upstream = template_channel.clone();
         let commands_rx_shared = commands_rx_shared.clone();
         let runtime_for_upstream = runtime.clone();
+        let pool_min_diff_tx_for_upstream = pool_min_diff_tx.clone();
         if !pool_host.is_empty() && !pool_pubkey_hex.is_empty() {
             tokio::spawn(async move {
                 if let Err(e) = run_datum_upstream(
@@ -373,6 +380,7 @@ async fn run_async(cfg: Config) {
                     template_ch_for_upstream,
                     commands_rx_shared,
                     runtime_for_upstream,
+                    pool_min_diff_tx_for_upstream,
                 )
                 .await
                 {
@@ -511,6 +519,7 @@ async fn run_datum_upstream(
         tokio::sync::Mutex<tokio::sync::mpsc::Receiver<datum_protocol::UpstreamCommand>>,
     >,
     runtime: Arc<RuntimeStats>,
+    pool_min_diff_tx: tokio::sync::watch::Sender<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool_pubkey =
         hex::decode(pool_pubkey_hex).map_err(|e| format!("decode pool pubkey hex: {e}"))?;
@@ -628,6 +637,10 @@ async fn run_datum_upstream(
                                 vardiff_min = cfg.vardiff_min,
                                 "client_config received from pool"
                             );
+                            // Publish the pool's vardiff floor so per-miner
+                            // vardiff loops never drop below it. Without this
+                            // every share rejects as DATUM_REJECT_BAD_TARGET.
+                            let _ = pool_min_diff_tx.send(cfg.vardiff_min);
                             client_config_seen = true;
                             if !coinbaser_requested {
                                 maybe_request_coinbaser(

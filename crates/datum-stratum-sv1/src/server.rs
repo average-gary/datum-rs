@@ -93,16 +93,26 @@ pub struct ServerState {
     pub notify_rx: watch::Receiver<Option<NotifyJob>>,
     pub submit_tx: Option<tokio::sync::mpsc::Sender<SubmittedShare>>,
     pub vardiff: VardiffParams,
+    /// Pool-supplied minimum difficulty floor — populated from the
+    /// `ClientConfig` frame the upstream sends right after handshake. The
+    /// per-connection vardiff loop respects `max(local_min, pool_min)` so a
+    /// miner cannot end up below what the pool will accept. Defaults to 0
+    /// before the first ClientConfig lands; the local config min still floors.
+    pub pool_min_diff: watch::Receiver<u64>,
 }
 
 impl ServerState {
-    pub fn new(notify_rx: watch::Receiver<Option<NotifyJob>>) -> Self {
+    pub fn new(
+        notify_rx: watch::Receiver<Option<NotifyJob>>,
+        pool_min_diff: watch::Receiver<u64>,
+    ) -> Self {
         Self {
             thread_id: 0,
             client_id: Arc::new(AtomicU32::new(0)),
             notify_rx,
             submit_tx: None,
             vardiff: VardiffParams::default(),
+            pool_min_diff,
         }
     }
 
@@ -176,7 +186,10 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
 
     // Vardiff per-connection state. The server task is the sole owner of this
     // miner's diff — no shared map / lock needed (Option A in the design).
-    let mut current_diff: u64 = state.vardiff.min;
+    // Floor at max(local_min, pool_min) so we never submit a share below what
+    // the pool will accept (otherwise every share lands as DATUM_REJECT_BAD_TARGET).
+    let pool_min = *state.pool_min_diff.borrow();
+    let mut current_diff: u64 = state.vardiff.min.max(pool_min);
     let mut shares_since_snap: u32 = 0;
     let mut last_snap = tokio::time::Instant::now();
     let mut diff_timer =
@@ -487,6 +500,13 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                 {
                     new_diff = (current_diff / 2).max(state.vardiff.min);
                 }
+                // Re-floor against the latest pool_min — ClientConfig may
+                // arrive after the connection started, raising the floor.
+                let pool_min = *state.pool_min_diff.borrow();
+                let floor = state.vardiff.min.max(pool_min);
+                if new_diff < floor {
+                    new_diff = floor;
+                }
                 if new_diff != current_diff && subscribed {
                     current_diff = new_diff;
                     send_set_difficulty(&mut wr, current_diff).await?;
@@ -677,7 +697,8 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (notify_tx, notify_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let state = ServerState::new(notify_rx);
+        let (_pool_min_tx, pool_min_rx) = watch::channel(0u64);
+        let state = ServerState::new(notify_rx, pool_min_rx);
         tokio::spawn(run(listener, state, shutdown_rx));
         (addr, notify_tx, shutdown_tx)
     }
@@ -693,7 +714,8 @@ mod tests {
         let (notify_tx, notify_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (submit_tx, submit_rx) = tokio::sync::mpsc::channel(8);
-        let state = ServerState::new(notify_rx).with_submit_tx(submit_tx);
+        let (_pool_min_tx, pool_min_rx) = watch::channel(0u64);
+        let state = ServerState::new(notify_rx, pool_min_rx).with_submit_tx(submit_tx);
         tokio::spawn(run(listener, state, shutdown_rx));
         (addr, notify_tx, shutdown_tx, submit_rx)
     }
@@ -711,7 +733,8 @@ mod tests {
         let (notify_tx, notify_rx) = watch::channel(None);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (submit_tx, submit_rx) = tokio::sync::mpsc::channel(64);
-        let state = ServerState::new(notify_rx)
+        let (_pool_min_tx, pool_min_rx) = watch::channel(0u64);
+        let state = ServerState::new(notify_rx, pool_min_rx)
             .with_submit_tx(submit_tx)
             .with_vardiff(vardiff);
         tokio::spawn(run(listener, state, shutdown_rx));
