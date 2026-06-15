@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 use datum_api::{ApiState, MetricsSource};
@@ -124,8 +125,15 @@ async fn run_async(cfg: Config) {
     )
     .parse()
     .expect("stratum.listen_addr/listen_port parses");
-    let sv1_state =
-        datum_stratum_sv1::server::ServerState::new(notify_rx).with_submit_tx(submit_tx.clone());
+    let vardiff_params = datum_stratum_sv1::server::VardiffParams {
+        min: cfg.stratum.vardiff_min,
+        target_shares_min: cfg.stratum.vardiff_target_shares_min.max(1) as u32,
+        recheck_secs: 30,
+        max: 1u64 << 40,
+    };
+    let sv1_state = datum_stratum_sv1::server::ServerState::new(notify_rx)
+        .with_submit_tx(submit_tx.clone())
+        .with_vardiff(vardiff_params);
 
     let sv1_handle = match tokio::net::TcpListener::bind(sv1_addr).await {
         Ok(listener) => {
@@ -282,10 +290,6 @@ async fn run_async(cfg: Config) {
     // corresponding JobEntry in the JobTracker, encode the full DATUM `0x27`
     // share-submission body (prefix + username + reserved + 0x01/0x02 first-
     // share-of-job/coinbase blobs + 0xFE cap + padding), and forward.
-    //
-    // current_diff: until we ship vardiff and per-miner mining.set_difficulty,
-    // every miner is implicitly on diff=1, so `floor_pot(1)=0` for the target
-    // byte. Once vardiff lands, this becomes a per-(client_id) lookup.
     let user_cfg = ShareUserConfig {
         pool_address: cfg.mining.pool_address.clone(),
         pass_full_users: cfg.datum.pool_pass_full_users,
@@ -296,8 +300,10 @@ async fn run_async(cfg: Config) {
         let jobs_for_relay = jobs.clone();
         let user_cfg_for_relay = user_cfg.clone();
         tokio::spawn(async move {
-            const CURRENT_DIFF: u64 = 1;
             while let Some(share) = submit_rx.recv().await {
+                // Per-miner diff is stamped on the SubmittedShare by the SV1
+                // server's vardiff loop.
+                let current_diff = share.current_diff;
                 let body = {
                     let mut g = jobs_for_relay.lock().await;
                     let Some(entry) = g.get_mut(&share.job_id) else {
@@ -308,7 +314,7 @@ async fn run_async(cfg: Config) {
                         );
                         continue;
                     };
-                    match build_share_submission(&share, entry, &user_cfg_for_relay, CURRENT_DIFF) {
+                    match build_share_submission(&share, entry, &user_cfg_for_relay, current_diff) {
                         Ok(body) => body,
                         Err(e) => {
                             tracing::warn!(
@@ -346,6 +352,7 @@ async fn run_async(cfg: Config) {
         let coinbaser_pub = coinbaser_pub;
         let template_ch_for_upstream = template_channel.clone();
         let commands_rx_shared = commands_rx_shared.clone();
+        let runtime_for_upstream = runtime.clone();
         if !pool_host.is_empty() && !pool_pubkey_hex.is_empty() {
             tokio::spawn(async move {
                 if let Err(e) = run_datum_upstream(
@@ -356,6 +363,7 @@ async fn run_async(cfg: Config) {
                     coinbaser_pub,
                     template_ch_for_upstream,
                     commands_rx_shared,
+                    runtime_for_upstream,
                 )
                 .await
                 {
@@ -482,6 +490,7 @@ async fn wait_for_shutdown() {
 /// Drive the DATUM upstream connection. On connect, push the OCEAN-supplied
 /// coinbaser blob to `coinbaser_pub` so the assembler can build notifies.
 /// Reconnects on disconnect with a fixed backoff.
+#[allow(clippy::too_many_arguments)]
 async fn run_datum_upstream(
     pool_host: &str,
     pool_port: u16,
@@ -492,6 +501,7 @@ async fn run_datum_upstream(
     external_commands_rx: std::sync::Arc<
         tokio::sync::Mutex<tokio::sync::mpsc::Receiver<datum_protocol::UpstreamCommand>>,
     >,
+    runtime: Arc<RuntimeStats>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool_pubkey =
         hex::decode(pool_pubkey_hex).map_err(|e| format!("decode pool pubkey hex: {e}"))?;
@@ -627,7 +637,35 @@ async fn run_datum_upstream(
                             }
                         }
                         datum_protocol::UpstreamEvent::ShareResponse(resp) => {
-                            tracing::debug!(?resp, "share response");
+                            // Pool-side correlation only — the wire ShareResponse
+                            // carries no username/request-id, so we cannot route
+                            // back to the originating SV1 miner here. Counters
+                            // are lifetime totals across reconnects.
+                            match resp.status {
+                                datum_protocol::ShareStatus::Accepted
+                                | datum_protocol::ShareStatus::AcceptedTentatively => {
+                                    runtime.record_share_accepted();
+                                    tracing::info!(
+                                        target: "datum_bin::shares",
+                                        status = ?resp.status,
+                                        nonce = format!("{:08x}", resp.nonce),
+                                        target_pot = resp.target_pot,
+                                        job_id = resp.job_id,
+                                        "pool accepted share"
+                                    );
+                                }
+                                datum_protocol::ShareStatus::Rejected => {
+                                    runtime.record_share_rejected();
+                                    tracing::info!(
+                                        target: "datum_bin::shares",
+                                        reject_reason = resp.reject_reason,
+                                        nonce = format!("{:08x}", resp.nonce),
+                                        target_pot = resp.target_pot,
+                                        job_id = resp.job_id,
+                                        "pool rejected share"
+                                    );
+                                }
+                            }
                         }
                         datum_protocol::UpstreamEvent::BlockNotify(_) => {
                             tracing::info!("block_notify from pool");
@@ -724,10 +762,11 @@ fn build_share_submission(
 ) -> Result<Vec<u8>, String> {
     let ntime = parse_u32_be_hex(&share.ntime_hex).ok_or("invalid ntime hex")?;
     let nonce = parse_u32_be_hex(&share.nonce_hex).ok_or("invalid nonce hex")?;
-    // SV1 doesn't include version-rolling in the base submit (BIP-310 adds it
-    // as an optional 6th param). Default to the template version baked into
-    // the job so the share's bits match the header the miner hashed.
-    let version: u32 = entry.meta.version;
+    // BIP-310: the miner's nversion has been masked by the SV1 server against
+    // the negotiated mask before reaching us, so a plain OR is safe (mirrors
+    // `bver |= vroll_uint;` at datum_stratum.c:1068).
+    let mut version: u32 = entry.meta.version;
+    version |= share.version_rolling;
 
     let extranonce2 = hex::decode(&share.extranonce2_hex).map_err(|e| e.to_string())?;
     let mut extranonce = [0u8; 12];
@@ -907,6 +946,10 @@ struct RuntimeStats {
     started: parking_lot::RwLock<bool>,
     rpc_url: parking_lot::RwLock<String>,
     sv2_registry: parking_lot::RwLock<Option<Arc<datum_stratum_sv2::ChannelRegistry>>>,
+    // Lifetime totals — survive across upstream reconnects on purpose; OCEAN's
+    // dashboard frames the same way. Process-restart resets are expected.
+    shares_accepted: AtomicU64,
+    shares_rejected: AtomicU64,
 }
 
 impl RuntimeStats {
@@ -925,6 +968,22 @@ impl RuntimeStats {
     fn set_sv2_registry(&self, reg: Arc<datum_stratum_sv2::ChannelRegistry>) {
         *self.sv2_registry.write() = Some(reg);
     }
+
+    fn record_share_accepted(&self) {
+        self.shares_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn record_share_rejected(&self) {
+        self.shares_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn shares_accepted(&self) -> u64 {
+        self.shares_accepted.load(Ordering::Relaxed)
+    }
+
+    fn shares_rejected(&self) -> u64 {
+        self.shares_rejected.load(Ordering::Relaxed)
+    }
 }
 
 struct RuntimeMetrics {
@@ -938,6 +997,8 @@ impl MetricsSource for RuntimeMetrics {
             "version": PKG_VERSION,
             "started": *self.runtime.started.read(),
             "rpc_url": *self.runtime.rpc_url.read(),
+            "shares_accepted": self.runtime.shares_accepted(),
+            "shares_rejected": self.runtime.shares_rejected(),
             "config": &self.cfg_summary,
             "note": "alpha — sv1 listener bound, sv2 registry online, protocol/template runtimes pending wiring"
         })
@@ -1059,4 +1120,36 @@ servers and the encrypted DATUM upstream client are scaffolded but not yet\n\
 wired into the run loop — block submission against live OCEAN is not\n\
 operational. See the v0.1.0 release notes for the runtime checklist.\n"
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn runtime_stats_counters_start_zero_and_increment() {
+        let s = RuntimeStats::new();
+        assert_eq!(s.shares_accepted(), 0);
+        assert_eq!(s.shares_rejected(), 0);
+        s.record_share_accepted();
+        s.record_share_accepted();
+        s.record_share_rejected();
+        assert_eq!(s.shares_accepted(), 2);
+        assert_eq!(s.shares_rejected(), 1);
+    }
+
+    #[test]
+    fn runtime_metrics_snapshot_exposes_share_counters() {
+        let runtime = Arc::new(RuntimeStats::new());
+        runtime.record_share_accepted();
+        runtime.record_share_rejected();
+        runtime.record_share_rejected();
+        let m = RuntimeMetrics {
+            runtime: runtime.clone(),
+            cfg_summary: serde_json::json!({}),
+        };
+        let snap = m.snapshot();
+        assert_eq!(snap["shares_accepted"], 1);
+        assert_eq!(snap["shares_rejected"], 2);
+    }
 }
