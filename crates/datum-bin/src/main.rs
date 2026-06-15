@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -5,7 +6,9 @@ use std::sync::Arc;
 
 use datum_api::{ApiState, MetricsSource};
 use datum_config::{Config, ConfigError};
+use datum_stratum_sv1::assembler::JobMeta;
 use serde_json::{json, Value};
+use tokio::sync::Mutex;
 
 const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");
 const DEFAULT_CONFIG_PATH: &str = "./datum_gateway_config.json";
@@ -94,6 +97,17 @@ async fn run_async(cfg: Config) {
 
     let runtime = Arc::new(RuntimeStats::new());
 
+    // Job tracker — keyed by the SV1 job-id hex string emitted in
+    // mining.notify. Populated by the assembler whenever it builds a notify
+    // (so the assembler-side state and the share-relay-side state are
+    // consistent) and read by the share-relay when a miner submits.
+    //
+    // The C reference also tracks per-(job, coinbase_id) `server_has_coinbase`
+    // and per-job `server_has_merkle_branches` flags so the optional 0x01 /
+    // 0x02 sub-blocks of the share submission are sent only on first use. We
+    // track those here as `AtomicBool`s embedded in the JobEntry.
+    let jobs = Arc::new(Mutex::new(JobTracker::new()));
+
     // SV1 stratum server. Bound on the configured port; receives notifies via
     // a watch channel that the runtime publishes to once a template + coinbaser
     // pair lands. Phase 4 wires the publisher; today the channel stays empty
@@ -101,6 +115,8 @@ async fn run_async(cfg: Config) {
     let (notify_tx, notify_rx) =
         tokio::sync::watch::channel::<Option<datum_stratum_sv1::server::NotifyParams>>(None);
     let (sv1_shutdown_tx, sv1_shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
+    let (submit_tx, mut submit_rx) =
+        tokio::sync::mpsc::channel::<datum_stratum_sv1::server::SubmittedShare>(64);
     let sv1_addr: SocketAddr = format!(
         "{}:{}",
         stratum_addr_or_default(&cfg),
@@ -108,7 +124,8 @@ async fn run_async(cfg: Config) {
     )
     .parse()
     .expect("stratum.listen_addr/listen_port parses");
-    let sv1_state = datum_stratum_sv1::server::ServerState::new(notify_rx);
+    let sv1_state =
+        datum_stratum_sv1::server::ServerState::new(notify_rx).with_submit_tx(submit_tx.clone());
 
     let sv1_handle = match tokio::net::TcpListener::bind(sv1_addr).await {
         Ok(listener) => {
@@ -182,9 +199,16 @@ async fn run_async(cfg: Config) {
         let notify_tx_for_assembler = notify_tx.clone();
         let mut t_sub = template_ch.clone();
         let mut c_sub = coinbaser_sub.clone();
-        let coinbase_tag = cfg.mining.coinbase_tag_primary.clone();
+        let coinbase_tag_primary = cfg.mining.coinbase_tag_primary.clone();
+        let coinbase_tag_secondary = cfg.mining.coinbase_tag_secondary.clone();
+        let coinbase_unique_id = cfg.mining.coinbase_unique_id;
+        let jobs_for_assembler = jobs.clone();
         tokio::spawn(async move {
-            let mut job_counter: u64 = 1;
+            let mut tick: u32 = 0;
+            // Coinbase variant — our SV1 server doesn't multi-coinbase (yet);
+            // OCEAN's pool dispatches up to 8 in the C reference. Use 0 for
+            // every emitted notify so the relay/upstream side stays consistent.
+            const COINBASE_ID: u8 = 0;
             loop {
                 tokio::select! {
                     biased;
@@ -199,21 +223,114 @@ async fn run_async(cfg: Config) {
                     Some(c) => c,
                     None => continue,
                 };
-                let job_id = format!("{job_counter:016x}");
-                let params = datum_stratum_sv1::assembler::assemble_notify(
+                let datum_job_idx = {
+                    let mut g = jobs_for_assembler.lock().await;
+                    g.next_idx()
+                };
+                // C job-id format: `%8.8x%2.2x%4.4x` then notify line appends
+                // `%2.2x` for cbselect → 18-char hex string. Match this exactly
+                // so the relay can recover `coinbase_id` from job_id[14..16]
+                // (the offset OCEAN's server expects per C reference).
+                let head = format!(
+                    "{:08x}{:02x}{:04x}",
+                    tick,
+                    datum_job_idx,
+                    (template.height as u16) ^ 0xC0DE
+                );
+                let job_id = format!("{head}{COINBASE_ID:02x}");
+                let scriptsig = datum_stratum_sv1::assembler::ScriptSigInputs {
+                    coinbase_tag_primary: coinbase_tag_primary.as_str(),
+                    coinbase_tag_secondary: coinbase_tag_secondary.as_str(),
+                    // Config field is u32 for forward-compat; the C reference's
+                    // uid push only stores 2 bytes — truncate.
+                    coinbase_unique_id: coinbase_unique_id as u16,
+                    enprefix: 0,
+                    pot_placeholder: 0xFF,
+                };
+                let (params, meta) = datum_stratum_sv1::assembler::assemble_notify_meta(
                     &job_id,
+                    datum_job_idx,
+                    COINBASE_ID,
                     &template,
                     &coinbaser,
-                    coinbase_tag.as_bytes(),
+                    scriptsig,
                     true,
                 );
+                {
+                    let mut g = jobs_for_assembler.lock().await;
+                    g.insert(job_id.clone(), meta);
+                }
                 if notify_tx_for_assembler
                     .send(Some(params.to_json_array()))
                     .is_err()
                 {
                     return;
                 }
-                job_counter = job_counter.wrapping_add(1);
+                tick = tick.wrapping_add(1);
+            }
+        });
+    }
+
+    // Persistent outbound-commands channel for the DATUM upstream task. Lives
+    // across reconnects so other tasks (the share-relay below) can keep a stable
+    // sender. `run_datum_upstream` drains from this on each successful connect.
+    let (commands_tx, commands_rx) =
+        tokio::sync::mpsc::channel::<datum_protocol::UpstreamCommand>(64);
+    let commands_rx_shared = std::sync::Arc::new(tokio::sync::Mutex::new(commands_rx));
+
+    // Share-relay: pop SubmittedShare from the SV1 submit channel, look up the
+    // corresponding JobEntry in the JobTracker, encode the full DATUM `0x27`
+    // share-submission body (prefix + username + reserved + 0x01/0x02 first-
+    // share-of-job/coinbase blobs + 0xFE cap + padding), and forward.
+    //
+    // current_diff: until we ship vardiff and per-miner mining.set_difficulty,
+    // every miner is implicitly on diff=1, so `floor_pot(1)=0` for the target
+    // byte. Once vardiff lands, this becomes a per-(client_id) lookup.
+    let user_cfg = ShareUserConfig {
+        pool_address: cfg.mining.pool_address.clone(),
+        pass_full_users: cfg.datum.pool_pass_full_users,
+        pass_workers: cfg.datum.pool_pass_workers,
+    };
+    {
+        let commands_tx_for_relay = commands_tx.clone();
+        let jobs_for_relay = jobs.clone();
+        let user_cfg_for_relay = user_cfg.clone();
+        tokio::spawn(async move {
+            const CURRENT_DIFF: u64 = 1;
+            while let Some(share) = submit_rx.recv().await {
+                let body = {
+                    let mut g = jobs_for_relay.lock().await;
+                    let Some(entry) = g.get_mut(&share.job_id) else {
+                        tracing::warn!(
+                            user = %share.username,
+                            job = %share.job_id,
+                            "share-relay: no JobEntry for job_id; dropping (likely stale or pre-notify share)"
+                        );
+                        continue;
+                    };
+                    match build_share_submission(&share, entry, &user_cfg_for_relay, CURRENT_DIFF) {
+                        Ok(body) => body,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "share-relay: encode failed; dropping submit"
+                            );
+                            continue;
+                        }
+                    }
+                };
+                if let Err(e) = commands_tx_for_relay
+                    .send(datum_protocol::UpstreamCommand::SubmitShare(body))
+                    .await
+                {
+                    tracing::warn!(error = %e, "share-relay: commands_tx send failed");
+                    return;
+                }
+                tracing::info!(
+                    user = %share.username,
+                    job = %share.job_id,
+                    "share forwarded to DATUM upstream"
+                );
             }
         });
     }
@@ -228,6 +345,7 @@ async fn run_async(cfg: Config) {
         let mining_pool_address = cfg.mining.pool_address.clone();
         let coinbaser_pub = coinbaser_pub;
         let template_ch_for_upstream = template_channel.clone();
+        let commands_rx_shared = commands_rx_shared.clone();
         if !pool_host.is_empty() && !pool_pubkey_hex.is_empty() {
             tokio::spawn(async move {
                 if let Err(e) = run_datum_upstream(
@@ -237,6 +355,7 @@ async fn run_async(cfg: Config) {
                     &mining_pool_address,
                     coinbaser_pub,
                     template_ch_for_upstream,
+                    commands_rx_shared,
                 )
                 .await
                 {
@@ -295,6 +414,63 @@ async fn run_async(cfg: Config) {
     let _ = notify_tx;
 }
 
+/// Per-job context tracked by [`JobTracker`]. Wraps [`JobMeta`] with the
+/// "send-once-per-(job, coinbase_id)" flags the C reference uses to amortise
+/// the bulky 0x01 / 0x02 sub-blocks of the DATUM `0x27` share submission.
+#[derive(Debug)]
+struct JobEntry {
+    meta: JobMeta,
+    server_has_merkle_branches: bool,
+    server_has_coinbase: [bool; 8],
+}
+
+#[derive(Debug, Default)]
+struct JobTracker {
+    /// Bounded map keyed by the SV1 wire job-id (hex string emitted in
+    /// `mining.notify`). The C reference uses an 8-bit ring of 256 slots; we
+    /// model the same eviction explicitly via `order` queue.
+    by_job_id: HashMap<String, JobEntry>,
+    /// Insertion order — oldest entries are evicted when capacity is reached.
+    order: std::collections::VecDeque<String>,
+    /// 8-bit ring counter for `datum_job_idx`; wraps at 255.
+    next_datum_idx: u8,
+}
+
+impl JobTracker {
+    const MAX: usize = 256;
+
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn next_idx(&mut self) -> u8 {
+        let v = self.next_datum_idx;
+        self.next_datum_idx = self.next_datum_idx.wrapping_add(1);
+        v
+    }
+
+    fn insert(&mut self, job_id: String, meta: JobMeta) {
+        if self.by_job_id.len() >= Self::MAX {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_job_id.remove(&oldest);
+            }
+        }
+        self.order.push_back(job_id.clone());
+        self.by_job_id.insert(
+            job_id,
+            JobEntry {
+                meta,
+                server_has_merkle_branches: false,
+                server_has_coinbase: [false; 8],
+            },
+        );
+    }
+
+    fn get_mut(&mut self, job_id: &str) -> Option<&mut JobEntry> {
+        self.by_job_id.get_mut(job_id)
+    }
+}
+
 async fn wait_for_shutdown() {
     let ctrl_c = tokio::signal::ctrl_c();
     match ctrl_c.await {
@@ -313,6 +489,9 @@ async fn run_datum_upstream(
     _mining_pool_address: &str,
     coinbaser_pub: datum_coinbaser::CoinbaserPublisher,
     template_channel: Option<datum_blocktemplates::TemplateChannel>,
+    external_commands_rx: std::sync::Arc<
+        tokio::sync::Mutex<tokio::sync::mpsc::Receiver<datum_protocol::UpstreamCommand>>,
+    >,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool_pubkey =
         hex::decode(pool_pubkey_hex).map_err(|e| format!("decode pool pubkey hex: {e}"))?;
@@ -345,6 +524,21 @@ async fn run_datum_upstream(
                 let connected = std::sync::Arc::new(connected);
                 let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
                 let (commands_tx, commands_rx) = tokio::sync::mpsc::channel(64);
+
+                // Bridge external commands (e.g. share submissions from the
+                // SV1 server's submit handler) into this per-connection
+                // commands channel. The bridge ends when this connection is
+                // torn down so the next reconnect starts fresh.
+                let bridge_tx = commands_tx.clone();
+                let bridge_rx = external_commands_rx.clone();
+                let bridge = tokio::spawn(async move {
+                    let mut guard = bridge_rx.lock().await;
+                    while let Some(cmd) = guard.recv().await {
+                        if bridge_tx.send(cmd).await.is_err() {
+                            return;
+                        }
+                    }
+                });
 
                 let coinbaser_pub = coinbaser_pub.clone();
                 let event_loop = {
@@ -456,6 +650,7 @@ async fn run_datum_upstream(
                     }
                 }
                 event_loop.abort();
+                bridge.abort();
                 tracing::warn!("DATUM event stream closed");
             }
             Err(e) => {
@@ -464,6 +659,176 @@ async fn run_datum_upstream(
         }
         tokio::time::sleep(backoff).await;
     }
+}
+
+/// Configuration knobs the share-relay needs to format the username field of a
+/// DATUM `0x27` share submission.
+#[derive(Debug, Clone)]
+struct ShareUserConfig {
+    pool_address: String,
+    pass_full_users: bool,
+    pass_workers: bool,
+}
+
+/// Format the share's username field per `datum_protocol.c:1340-1351`. Three
+/// behaviors: both flags false OR no miner username uses the configured pool
+/// address; `pass_full_users` with a miner username that doesn't start with
+/// `.` uses the miner username verbatim; otherwise the result is
+/// `pool_address` joined with the miner username (with a `.` separator unless
+/// the miner already prefixed one). Cap at 384 bytes (matches the C
+/// `username[385]` buffer minus null).
+fn format_share_username(miner_user: &str, cfg: &ShareUserConfig) -> Vec<u8> {
+    let s = if (!cfg.pass_full_users && !cfg.pass_workers) || miner_user.is_empty() {
+        cfg.pool_address.clone()
+    } else if cfg.pass_full_users && !miner_user.starts_with('.') {
+        miner_user.to_string()
+    } else if cfg.pass_full_users || cfg.pass_workers {
+        let sep = if miner_user.starts_with('.') { "" } else { "." };
+        format!("{}{}{}", cfg.pool_address, sep, miner_user)
+    } else {
+        cfg.pool_address.clone()
+    };
+    let mut out = s.into_bytes();
+    out.truncate(384);
+    out
+}
+
+/// `floorPoT(x)`: position of the highest set bit; 0 for x=0. Mirrors
+/// `datum_utils.c::floorPoT`.
+fn floor_pot(x: u64) -> u8 {
+    if x == 0 {
+        0
+    } else {
+        (63 - x.leading_zeros()) as u8
+    }
+}
+
+/// Encode a `mining.submit` payload into a complete DATUM `0x27` share
+/// submission body, matching `datum_protocol.c::datum_protocol_pow:1313-1438`.
+///
+/// Layout: fixed 30-byte prefix, null-terminated username, 4 reserved zero
+/// bytes, optional 0x01 first-share-of-job block (prevhash, target byte index,
+/// nbits, datum_coinbaser_id, height, coinbase_value, four tx counts, and the
+/// merkle-branch table), optional 0x02 first-share-of-coinbase block
+/// (coinb1_len, coinb2_len, coinb1_bin, coinb2_bin), 0xFE cap, random padding
+/// of 1 to 80 bytes.
+///
+/// The 0x01 / 0x02 sub-blocks are sent ONCE per (job, coinbase_id); the
+/// `entry` flags track that. The runtime is responsible for never resetting
+/// these flags after a successful submit.
+fn build_share_submission(
+    share: &datum_stratum_sv1::server::SubmittedShare,
+    entry: &mut JobEntry,
+    user_cfg: &ShareUserConfig,
+    current_diff: u64,
+) -> Result<Vec<u8>, String> {
+    let ntime = parse_u32_be_hex(&share.ntime_hex).ok_or("invalid ntime hex")?;
+    let nonce = parse_u32_be_hex(&share.nonce_hex).ok_or("invalid nonce hex")?;
+    // SV1 doesn't include version-rolling in the base submit (BIP-310 adds it
+    // as an optional 6th param). Default to the template version baked into
+    // the job so the share's bits match the header the miner hashed.
+    let version: u32 = entry.meta.version;
+
+    let extranonce2 = hex::decode(&share.extranonce2_hex).map_err(|e| e.to_string())?;
+    let mut extranonce = [0u8; 12];
+    extranonce[..4].copy_from_slice(&share.extranonce1);
+    let take = extranonce2.len().min(8);
+    extranonce[4..4 + take].copy_from_slice(&extranonce2[..take]);
+
+    // PoT target byte tied to the diff this miner was on at submit time.
+    let target_byte = floor_pot(current_diff);
+    // Flags: bit0=is_block, bit1=subsidy_only, bit2=quickdiff. We don't yet
+    // detect block-found locally and don't run subsidy_only or quickdiff.
+    let flags: u8 = 0;
+
+    let prefix = datum_protocol::ShareSubmissionPrefix {
+        job_id: entry.meta.datum_job_idx,
+        coinbase_id: entry.meta.coinbase_id,
+        flags,
+        target_byte,
+        ntime,
+        nonce,
+        version,
+        extranonce,
+    };
+    let mut body = prefix.encode();
+
+    // Username (null-terminated). C uses snprintf which always writes a NUL.
+    let user_bytes = format_share_username(&share.username, user_cfg);
+    body.extend_from_slice(&user_bytes);
+    body.push(0);
+
+    // 4 reserved bytes (zero) for future use.
+    body.extend_from_slice(&[0u8; 4]);
+
+    // 0x01 sub-block: prevhash + nbits + height + coinbase_value + tx counts
+    // + merkle branches. Sent once per job until server has it.
+    if !entry.server_has_merkle_branches {
+        body.push(0x01);
+        body.extend_from_slice(&entry.meta.prevhash_bin);
+        body.extend_from_slice(&entry.meta.target_pot_index.to_le_bytes());
+        body.extend_from_slice(&entry.meta.nbits_bin);
+        body.push(entry.meta.datum_coinbaser_id);
+        body.extend_from_slice(&entry.meta.height.to_le_bytes());
+        body.extend_from_slice(&entry.meta.coinbase_value.to_le_bytes());
+        body.extend_from_slice(&entry.meta.txn_count.to_le_bytes());
+        body.extend_from_slice(&entry.meta.txn_total_weight.to_le_bytes());
+        body.extend_from_slice(&entry.meta.txn_total_size.to_le_bytes());
+        body.extend_from_slice(&entry.meta.txn_total_sigops.to_le_bytes());
+        body.push(entry.meta.merkle_branches_bin.len() as u8);
+        for branch in &entry.meta.merkle_branches_bin {
+            body.extend_from_slice(branch);
+        }
+        entry.server_has_merkle_branches = true;
+    }
+
+    // 0x02 sub-block: full coinb1/coinb2 binaries. Sent once per (job,
+    // coinbase_id) until server has it.
+    let cb_id = entry.meta.coinbase_id as usize;
+    let already_sent_coinbase =
+        cb_id < entry.server_has_coinbase.len() && entry.server_has_coinbase[cb_id];
+    if !already_sent_coinbase {
+        body.push(0x02);
+        body.push(entry.meta.coinbase_id);
+        let cb1_len = entry.meta.coinb1_bin.len() as u16;
+        let cb2_len = entry.meta.coinb2_bin.len() as u16;
+        body.extend_from_slice(&cb1_len.to_le_bytes());
+        body.extend_from_slice(&cb2_len.to_le_bytes());
+        body.extend_from_slice(&entry.meta.coinb1_bin);
+        body.extend_from_slice(&entry.meta.coinb2_bin);
+        if cb_id < entry.server_has_coinbase.len() {
+            entry.server_has_coinbase[cb_id] = true;
+        }
+    }
+
+    // Cap byte.
+    body.push(0xFE);
+
+    // Random padding 1-80 bytes (matches C's `1 + (rand() % 80)` plus repeat
+    // of a single random byte). Use a counter-derived "random" since the C
+    // path also doesn't seed from CSPRNG — this is purely traffic-shape
+    // obfuscation and doesn't need cryptographic strength.
+    let rb = padding_byte();
+    let pad_len = 1 + (rb as usize % 80);
+    body.extend(std::iter::repeat_n(rb, pad_len));
+
+    Ok(body)
+}
+
+fn parse_u32_be_hex(s: &str) -> Option<u32> {
+    let trimmed = s.strip_prefix("0x").unwrap_or(s);
+    u32::from_str_radix(trimmed, 16).ok()
+}
+
+fn padding_byte() -> u8 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
+    let mut x = STATE.load(Ordering::Relaxed);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    STATE.store(x, Ordering::Relaxed);
+    (x & 0xFF) as u8
 }
 
 async fn maybe_request_coinbaser(

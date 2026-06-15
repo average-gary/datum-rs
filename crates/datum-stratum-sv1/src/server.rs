@@ -15,11 +15,28 @@ use crate::{extranonce1, StratumRequest, StratumResponse};
 /// the SV1 server just relays whatever the runtime publishes.
 pub type NotifyParams = Value;
 
+/// Forwarded share-submit, populated when a miner sends `mining.submit`.
+/// The runtime decides what to do with it — typically encode as a DATUM
+/// `0x27` share submission and forward upstream.
+#[derive(Debug, Clone)]
+pub struct SubmittedShare {
+    pub username: String,
+    pub job_id: String,
+    pub extranonce2_hex: String,
+    pub ntime_hex: String,
+    pub nonce_hex: String,
+    /// Per-connection extranonce1 (4 bytes). The DATUM `0x27` opcode expects
+    /// the full 12-byte extranonce field as `xn1 || xn2`; we forward `xn1` so
+    /// the relay can prepend it.
+    pub extranonce1: [u8; 4],
+}
+
 #[derive(Clone)]
 pub struct ServerState {
     pub thread_id: u16,
     pub client_id: Arc<AtomicU32>,
     pub notify_rx: watch::Receiver<Option<NotifyParams>>,
+    pub submit_tx: Option<tokio::sync::mpsc::Sender<SubmittedShare>>,
 }
 
 impl ServerState {
@@ -28,7 +45,13 @@ impl ServerState {
             thread_id: 0,
             client_id: Arc::new(AtomicU32::new(0)),
             notify_rx,
+            submit_tx: None,
         }
+    }
+
+    pub fn with_submit_tx(mut self, tx: tokio::sync::mpsc::Sender<SubmittedShare>) -> Self {
+        self.submit_tx = Some(tx);
+        self
     }
 }
 
@@ -71,9 +94,15 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
     let client_id = state.client_id.fetch_add(1, Ordering::Relaxed);
     let xn1 = extranonce1(state.thread_id, client_id);
     let xn1_hex = format!("{xn1:08x}");
-    let extranonce2_size: u32 = 4;
+    // C reference: extranonce1 is 4 bytes, extranonce2 is 8 bytes — total 12.
+    // OCEAN's DATUM `0x27` opcode is hard-coded to a 12-byte extranonce field
+    // (`pow.extranonce[12]` + `msg[i]=12` length byte), and the server only
+    // accepts that split. Advertising 4 here would force the miner to send
+    // 4-byte extranonce2s, which would never reconstruct to 12 bytes upstream.
+    let extranonce2_size: u32 = 8;
     let mut subscribed = false;
     let mut authorized = false;
+    let mut authorized_username: String = String::new();
 
     let (rd, mut wr) = sock.into_split();
     let mut lines = BufReader::new(rd).lines();
@@ -114,6 +143,9 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                         subscribed = true;
                     }
                     "mining.authorize" => {
+                        if let Some(name) = req.params.get(0).and_then(|v| v.as_str()) {
+                            authorized_username = name.to_string();
+                        }
                         write_response(
                             &mut wr,
                             &StratumResponse::ok(req.id, Value::Bool(true)),
@@ -142,13 +174,60 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                             .await?;
                             continue;
                         }
-                        // Phase 3 acks structurally; PoW validation is the
-                        // runtime's job (needs real template + target).
-                        write_response(
-                            &mut wr,
-                            &StratumResponse::ok(req.id, Value::Bool(true)),
-                        )
-                        .await?;
+                        // Parse SV1 submit params: [username, job_id,
+                        // extranonce2_hex, ntime_hex, nonce_hex]
+                        let parsed = parse_submit_params(&req.params);
+                        match parsed {
+                            Some(s) => {
+                                let share = SubmittedShare {
+                                    username: if s.username.is_empty() {
+                                        authorized_username.clone()
+                                    } else {
+                                        s.username
+                                    },
+                                    job_id: s.job_id,
+                                    extranonce2_hex: s.extranonce2_hex,
+                                    ntime_hex: s.ntime_hex,
+                                    nonce_hex: s.nonce_hex,
+                                    // The wire-side extranonce1 bytes are the
+                                    // natural left-to-right interpretation of
+                                    // the 8-char hex emitted in mining.subscribe
+                                    // (`{xn1:08x}`) — i.e. big-endian byte order.
+                                    // C reference: `pk_u32le(extranonce_bin, 0,
+                                    // m->sid_inv)` writes those exact bytes.
+                                    extranonce1: xn1.to_be_bytes(),
+                                };
+                                if let Some(tx) = &state.submit_tx {
+                                    if tx.send(share).await.is_err() {
+                                        tracing::warn!("submit_tx receiver dropped");
+                                    }
+                                } else {
+                                    tracing::debug!(
+                                        "mining.submit received but no submit_tx wired"
+                                    );
+                                }
+                                // Optimistically ack — the upstream pool
+                                // sends a separate ShareResponse asynchronously
+                                // which the runtime can route back via
+                                // future plumbing.
+                                write_response(
+                                    &mut wr,
+                                    &StratumResponse::ok(req.id, Value::Bool(true)),
+                                )
+                                .await?;
+                            }
+                            None => {
+                                write_response(
+                                    &mut wr,
+                                    &StratumResponse::err(
+                                        req.id,
+                                        20,
+                                        "Malformed mining.submit params",
+                                    ),
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     "mining.suggest_difficulty" => {
                         write_response(&mut wr, &StratumResponse::ok(req.id, Value::Bool(true))).await?;
@@ -175,6 +254,31 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
             }
         }
     }
+}
+
+/// SV1 `mining.submit` params: `[username, job_id, extranonce2, ntime, nonce]`,
+/// all strings. Returns `None` if the array is missing, has fewer than 5
+/// entries, or any entry is not a string.
+fn parse_submit_params(params: &Value) -> Option<SubmittedShare> {
+    let arr = params.as_array()?;
+    if arr.len() < 5 {
+        return None;
+    }
+    let username = arr[0].as_str()?.to_string();
+    let job_id = arr[1].as_str()?.to_string();
+    let extranonce2_hex = arr[2].as_str()?.to_string();
+    let ntime_hex = arr[3].as_str()?.to_string();
+    let nonce_hex = arr[4].as_str()?.to_string();
+    Some(SubmittedShare {
+        username,
+        job_id,
+        extranonce2_hex,
+        ntime_hex,
+        nonce_hex,
+        // The connection-bound extranonce1 is filled in at the call site;
+        // parse_submit_params only knows the wire-supplied fields.
+        extranonce1: [0u8; 4],
+    })
 }
 
 async fn write_response<W: AsyncWriteExt + Unpin>(
@@ -243,7 +347,7 @@ mod tests {
         // result is [subscriptions, extranonce1_hex, extranonce2_size]
         let xn1_hex = v["result"][1].as_str().unwrap();
         assert_eq!(xn1_hex.len(), 8);
-        assert_eq!(v["result"][2], 4);
+        assert_eq!(v["result"][2], 8);
 
         // mining.authorize
         wr.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"bc1q\",\"x\"]}\n")

@@ -96,6 +96,54 @@ pub struct NotifyParams {
     pub clean_jobs: bool,
 }
 
+/// Per-job context the runtime needs to encode a DATUM `0x27` share submission.
+/// Built alongside [`NotifyParams`] by [`assemble_notify_meta`]. The runtime
+/// stores one of these per emitted job-id so the share-relay can reconstruct
+/// every byte the upstream pool needs.
+#[derive(Debug, Clone)]
+pub struct JobMeta {
+    /// 8-bit job index assigned by the runtime — populated into the `0x27`
+    /// `datum_job_id` field. The runtime owns the allocator (8-bit ring per C).
+    pub datum_job_idx: u8,
+    /// 8-bit coinbase variant used for this notify (always 0 today; OCEAN's
+    /// pool may select among up to 8 variants per the C reference).
+    pub coinbase_id: u8,
+    /// `target_pot_index`: byte offset in `coinb1` of the PoT placeholder. The
+    /// runtime overwrites this byte with `floorPoT(diff)` immediately before
+    /// hashing the candidate header, and the same byte is sent in the share
+    /// submission so the server can verify the work-against-PoT-target.
+    pub target_pot_index: u16,
+    /// Block version baked into the notify; copied verbatim into the share's
+    /// `version` field.
+    pub version: u32,
+    /// Block height of this template.
+    pub height: u32,
+    /// Coinbase value (sats) of this template.
+    pub coinbase_value: u64,
+    /// Internal byte-order prevhash (the same 32 bytes used in
+    /// `RequestCoinbaser`).
+    pub prevhash_bin: [u8; 32],
+    /// `nbits` as 4 little-endian bytes.
+    pub nbits_bin: [u8; 4],
+    /// Sibling-path merkle branches (each 32 bytes, big-endian txid display
+    /// order — matches what the assembler put in the SV1 wire frame).
+    pub merkle_branches_bin: Vec<[u8; 32]>,
+    /// Full coinb1 / coinb2 raw bytes (NOT the hex). Forwarded to the upstream
+    /// pool the first time a share lands for this (job, coinbase_id).
+    pub coinb1_bin: Vec<u8>,
+    pub coinb2_bin: Vec<u8>,
+    /// Coinbaser blob id (`datum_id`) that produced this job's outputs.
+    pub datum_coinbaser_id: u8,
+    /// Transaction count from the GBT template.
+    pub txn_count: u32,
+    /// Total weight of all transactions in the template.
+    pub txn_total_weight: u32,
+    /// Total size in bytes of all transactions.
+    pub txn_total_size: u32,
+    /// Total sigops across all transactions.
+    pub txn_total_sigops: u32,
+}
+
 impl NotifyParams {
     pub fn to_json_array(&self) -> Value {
         json!([
@@ -149,25 +197,92 @@ pub fn assemble_notify_with_scriptsig(
     scriptsig: ScriptSigInputs<'_>,
     clean_jobs: bool,
 ) -> NotifyParams {
+    assemble_notify_meta(job_id, 0, 0, template, coinbaser, scriptsig, clean_jobs).0
+}
+
+/// Like [`assemble_notify_with_scriptsig`] but also returns a [`JobMeta`] that
+/// captures every per-job field the share-relay later needs to encode the
+/// DATUM `0x27` share-submission body.
+pub fn assemble_notify_meta(
+    job_id: &str,
+    datum_job_idx: u8,
+    coinbase_id: u8,
+    template: &Template,
+    coinbaser: &CoinbaserBlob,
+    scriptsig: ScriptSigInputs<'_>,
+    clean_jobs: bool,
+) -> (NotifyParams, JobMeta) {
     let coinbase_tx_outputs = build_outputs(template, coinbaser);
-    let (coinb1, coinb2) = build_split_coinbase(template, &scriptsig, &coinbase_tx_outputs);
+    let (coinb1_bin, coinb2_bin, target_pot_index) =
+        build_split_coinbase_bin(template, &scriptsig, &coinbase_tx_outputs);
     let merkle_branch = build_merkle_branch(template);
 
     let prev_hash = swap_prev_hash_for_stratum(&template.previous_block_hash);
     let version_hex = format!("{:08x}", template.version);
     let ntime_hex = format!("{:08x}", template.curtime as u32);
 
-    NotifyParams {
+    let merkle_branches_bin: Vec<[u8; 32]> = merkle_branch
+        .iter()
+        .filter_map(|hex_be| {
+            let v = hex::decode(hex_be).ok()?;
+            (v.len() == 32).then(|| <[u8; 32]>::try_from(v.as_slice()).ok())?
+        })
+        .collect();
+
+    let nbits_bin: [u8; 4] = hex::decode(&template.bits)
+        .ok()
+        .and_then(|v| <[u8; 4]>::try_from(v.as_slice()).ok())
+        .unwrap_or([0u8; 4]);
+
+    let prevhash_bin: [u8; 32] = hex::decode(&template.previous_block_hash)
+        .ok()
+        .and_then(|v| {
+            // GBT returns big-endian display hex; internal-order is reversed.
+            let mut a = <[u8; 32]>::try_from(v.as_slice()).ok()?;
+            a.reverse();
+            Some(a)
+        })
+        .unwrap_or([0u8; 32]);
+
+    let txn_count = template.transactions.len() as u32;
+    let txn_total_weight: u32 = template.transactions.iter().map(|t| t.weight).sum();
+    let txn_total_size: u32 = template
+        .transactions
+        .iter()
+        .map(|t| t.data.len() as u32 / 2)
+        .sum();
+    let txn_total_sigops: u32 = template.transactions.iter().map(|t| t.sigops).sum();
+
+    let notify = NotifyParams {
         job_id: job_id.to_string(),
         prev_hash,
-        coinb1,
-        coinb2,
+        coinb1: hex::encode(&coinb1_bin),
+        coinb2: hex::encode(&coinb2_bin),
         merkle_branch,
         version_hex,
         nbits_hex: template.bits.clone(),
         ntime_hex,
         clean_jobs,
-    }
+    };
+    let meta = JobMeta {
+        datum_job_idx,
+        coinbase_id,
+        target_pot_index,
+        version: template.version,
+        height: template.height,
+        coinbase_value: template.coinbase_value,
+        prevhash_bin,
+        nbits_bin,
+        merkle_branches_bin,
+        coinb1_bin,
+        coinb2_bin,
+        datum_coinbaser_id: coinbaser.datum_id,
+        txn_count,
+        txn_total_weight,
+        txn_total_size,
+        txn_total_sigops,
+    };
+    (notify, meta)
 }
 
 /// SV1 `prev_hash` field is the GBT `previousblockhash` with **internal-byte
@@ -214,11 +329,16 @@ fn build_outputs(template: &Template, coinbaser: &CoinbaserBlob) -> Vec<u8> {
     buf
 }
 
-fn build_split_coinbase(
+/// Returns `(coinb1, coinb2, target_pot_index)`. `target_pot_index` is the
+/// byte offset in `coinb1` where the PoT placeholder lives — per
+/// `datum_coinbaser.c:62-167`, the PoT byte is the FIRST byte of the uid push
+/// block (`[0x03][PoT][uid_lo][uid_hi]`), placed immediately after the tag
+/// block.
+fn build_split_coinbase_bin(
     template: &Template,
     scriptsig: &ScriptSigInputs<'_>,
     outputs_blob: &[u8],
-) -> (String, String) {
+) -> (Vec<u8>, Vec<u8>, u16) {
     // CRITICAL: Stratum V1 mining.notify uses LEGACY (non-segwit) coinbase
     // serialization. The witness commitment lives as a normal output in the
     // outputs blob (handled by build_outputs); no marker/flag in the tx
@@ -261,6 +381,10 @@ fn build_split_coinbase(
     push_varint(&mut coinb1, scriptsig_len as u64);
     coinb1.extend_from_slice(&height_script);
     coinb1.extend_from_slice(&tag_block);
+    // The PoT placeholder byte lives at offset 1 of `uid_block` (right after
+    // the 0x03 push-3 opcode). Capture the absolute coinb1 offset BEFORE we
+    // append uid_block.
+    let target_pot_index = (coinb1.len() + 1) as u16;
     coinb1.extend_from_slice(&uid_block);
     coinb1.push(0x0E);
     coinb1.extend_from_slice(&scriptsig.enprefix.to_le_bytes());
@@ -274,7 +398,7 @@ fn build_split_coinbase(
     // locktime (4)
     coinb2.extend_from_slice(&0u32.to_le_bytes());
 
-    (hex::encode(coinb1), hex::encode(coinb2))
+    (coinb1, coinb2, target_pot_index)
 }
 
 /// BIP34 coinbase scriptSig height encoding via the C reference's
