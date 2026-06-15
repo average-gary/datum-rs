@@ -21,10 +21,22 @@ const POOL_VERSION_MASK: u32 = 0x1fffe000;
 /// per-miner before sending — the C reference does the same in
 /// `datum_stratum.c:1597-1598`. A `target_pot_index` of 0 disables patching
 /// (used by tests with synthetic params).
+///
+/// `coinb1_bin` and `job_id` are populated by the runtime so the server can
+/// snapshot the exact patched bytes the miner hashed when emitting notify;
+/// the share-relay then ships those exact bytes in the DATUM `0x27` 0x02
+/// sub-block (see [`SubmittedShare::patched_coinb1_bin`]).
 #[derive(Debug, Clone)]
 pub struct NotifyJob {
     pub params: Value,
     pub target_pot_index: u16,
+    /// Raw, un-patched coinb1 bytes for this job (PoT byte still at
+    /// placeholder). Empty Vec for synthetic-test jobs that pass
+    /// `target_pot_index == 0`.
+    pub coinb1_bin: Vec<u8>,
+    /// SV1 wire job-id (hex string emitted in mining.notify params[0]).
+    /// Empty string for synthetic-test jobs.
+    pub job_id: String,
 }
 
 impl NotifyJob {
@@ -32,6 +44,22 @@ impl NotifyJob {
         Self {
             params,
             target_pot_index,
+            coinb1_bin: Vec::new(),
+            job_id: String::new(),
+        }
+    }
+
+    pub fn with_coinb1(
+        params: Value,
+        target_pot_index: u16,
+        coinb1_bin: Vec<u8>,
+        job_id: String,
+    ) -> Self {
+        Self {
+            params,
+            target_pot_index,
+            coinb1_bin,
+            job_id,
         }
     }
 }
@@ -61,7 +89,19 @@ pub struct SubmittedShare {
     /// by the SV1 server's vardiff loop (the server task is the sole owner of
     /// the per-connection diff state). Used by the share-relay to set the
     /// DATUM `0x27` `target_byte = floor_pot(current_diff)`.
+    ///
+    /// NOTE: this is the diff that was active at the LAST notify emit for
+    /// `job_id` (D_emit), not the live per-connection diff at submit time
+    /// (D_live). When vardiff bumps mid-job, an in-flight share submitted on
+    /// the old job_id still carries D_emit so the PoT byte in
+    /// [`Self::patched_coinb1_bin`] matches the prefix `target_byte`.
     pub current_diff: u64,
+    /// Exact PoT-patched coinb1 bytes the miner hashed for `job_id`, captured
+    /// from the per-connection emit ring at submit time. `None` only when the
+    /// miner cited a job_id we never sent (or one evicted from the 2-slot
+    /// ring). The relay drops shares with `None` rather than re-deriving the
+    /// patch — that re-derivation is exactly the diff_race_02_block bug.
+    pub patched_coinb1_bin: Option<Vec<u8>>,
 }
 
 /// Per-connection vardiff knobs. Defaults match `vardiff_min=1`,
@@ -192,6 +232,14 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
     let mut current_diff: u64 = state.vardiff.min.max(pool_min);
     let mut shares_since_snap: u32 = 0;
     let mut last_snap = tokio::time::Instant::now();
+
+    // Per-connection 2-slot ring of "what coinb1 the miner hashed for which
+    // job_id at which diff." [0] = most recent emit, [1] = previous emit.
+    // Closes the diff_race_02_block window: a miner that finishes searching
+    // the OLD notify after a vardiff bump still resolves to the original
+    // patched bytes via slot [1], so the 0x02 sub-block matches what was
+    // hashed.
+    let mut emit_ring: [Option<EmittedJob>; 2] = [None, None];
     let mut diff_timer =
         tokio::time::interval(std::time::Duration::from_secs(state.vardiff.recheck_secs));
     diff_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -358,6 +406,18 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                         authorized = true;
                         let pending = notify_rx.borrow().clone();
                         if let Some(job) = pending {
+                            ring_push(
+                                &mut emit_ring,
+                                EmittedJob {
+                                    job_id: job.job_id.clone(),
+                                    patched_coinb1_bin: patch_coinb1_bytes(
+                                        &job.coinb1_bin,
+                                        job.target_pot_index,
+                                        current_diff,
+                                    ),
+                                    diff: current_diff,
+                                },
+                            );
                             send_notify(&mut wr, &job, current_diff).await?;
                         }
                     }
@@ -404,6 +464,20 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                                     // Version-rolling not negotiated: ignore any 6th param.
                                     0
                                 };
+                                // Resolve the (job_id, miner) tuple to the
+                                // exact patched coinb1 + diff that was emitted.
+                                // The lookup is the load-bearing fix: if we
+                                // re-derived from current_diff here, a vardiff
+                                // bump between emit and submit would skew the
+                                // 0x02 sub-block bytes vs what the miner
+                                // hashed (the diff_race_02_block bug).
+                                let emitted = ring_lookup(&emit_ring, &s.job_id);
+                                let share_diff = emitted
+                                    .as_ref()
+                                    .map(|e| e.diff)
+                                    .unwrap_or(current_diff);
+                                let patched_coinb1_bin =
+                                    emitted.map(|e| e.patched_coinb1_bin);
                                 let share = SubmittedShare {
                                     username: if s.username.is_empty() {
                                         authorized_username.clone()
@@ -422,7 +496,8 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                                     // m->sid_inv)` writes those exact bytes.
                                     extranonce1: xn1.to_be_bytes(),
                                     version_rolling,
-                                    current_diff,
+                                    current_diff: share_diff,
+                                    patched_coinb1_bin,
                                 };
                                 shares_since_snap = shares_since_snap.saturating_add(1);
                                 if let Some(tx) = &state.submit_tx {
@@ -476,6 +551,18 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                 if subscribed && authorized {
                     let pending = notify_rx.borrow_and_update().clone();
                     if let Some(job) = pending {
+                        ring_push(
+                            &mut emit_ring,
+                            EmittedJob {
+                                job_id: job.job_id.clone(),
+                                patched_coinb1_bin: patch_coinb1_bytes(
+                                    &job.coinb1_bin,
+                                    job.target_pot_index,
+                                    current_diff,
+                                ),
+                                diff: current_diff,
+                            },
+                        );
                         send_notify(&mut wr, &job, current_diff).await?;
                     }
                 }
@@ -523,6 +610,18 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                     if authorized {
                         let pending = notify_rx.borrow().clone();
                         if let Some(job) = pending {
+                            ring_push(
+                                &mut emit_ring,
+                                EmittedJob {
+                                    job_id: job.job_id.clone(),
+                                    patched_coinb1_bin: patch_coinb1_bytes(
+                                        &job.coinb1_bin,
+                                        job.target_pot_index,
+                                        current_diff,
+                                    ),
+                                    diff: current_diff,
+                                },
+                            );
                             send_notify(&mut wr, &job, current_diff).await?;
                         }
                     }
@@ -600,6 +699,53 @@ async fn send_notify<W: AsyncWriteExt + Unpin>(
     let mut s = serde_json::to_string(&frame).unwrap();
     s.push('\n');
     wr.write_all(s.as_bytes()).await
+}
+
+/// Snapshot of an emitted job — the exact PoT-patched coinb1 bytes the miner
+/// will hash for this `job_id` at this `diff`. Stamped onto every
+/// [`SubmittedShare`] whose `job_id` matches. Pure data; small enough to
+/// clone cheaply per submit.
+#[derive(Debug, Clone)]
+struct EmittedJob {
+    job_id: String,
+    /// PoT-patched coinb1 bytes (same patch the wire-side hex received).
+    patched_coinb1_bin: Vec<u8>,
+    /// Diff active at emit time. Mirrors the `target_byte = floor_pot(diff)`
+    /// the relay will encode in the share-submission prefix.
+    diff: u64,
+}
+
+/// Push a fresh emit snapshot into the 2-slot ring. New entry takes slot [0];
+/// previous slot [0] shifts to [1]; previous slot [1] is dropped.
+fn ring_push(ring: &mut [Option<EmittedJob>; 2], entry: EmittedJob) {
+    ring[1] = ring[0].take();
+    ring[0] = Some(entry);
+}
+
+/// Look up a job_id in the ring; clones the patched coinb1 + diff if found.
+fn ring_lookup(ring: &[Option<EmittedJob>; 2], job_id: &str) -> Option<EmittedJob> {
+    for e in ring.iter().flatten() {
+        if e.job_id == job_id {
+            return Some(e.clone());
+        }
+    }
+    None
+}
+
+/// Compute the PoT-patched coinb1 bytes for an emit. Mirrors the wire-side
+/// hex patch (`patch_coinb1_pot_byte`) at byte level so the snapshot the
+/// relay ships in the 0x02 sub-block is byte-identical to what the miner
+/// hashed. `target_pot_index == 0` returns the input unchanged (test path).
+fn patch_coinb1_bytes(coinb1_bin: &[u8], target_pot_index: u16, current_diff: u64) -> Vec<u8> {
+    let mut out = coinb1_bin.to_vec();
+    if target_pot_index == 0 {
+        return out;
+    }
+    let idx = target_pot_index as usize;
+    if idx < out.len() {
+        out[idx] = floor_pot(current_diff);
+    }
+    out
 }
 
 /// Patch the PoT placeholder byte inside `coinb1` (params index 2) at
@@ -1186,5 +1332,206 @@ mod tests {
         let share = submit_rx.recv().await.unwrap();
         // Default vardiff.min == 1.
         assert_eq!(share.current_diff, 1);
+        // Synthetic test path uses target_pot_index=0 and empty job_id, so
+        // ring_lookup returns None and the share has no snapshot. That's
+        // the documented behavior — production paths supply a real job_id.
+        assert!(share.patched_coinb1_bin.is_none());
+    }
+
+    #[test]
+    fn ring_push_keeps_two_most_recent_entries() {
+        let mut ring: [Option<EmittedJob>; 2] = [None, None];
+        ring_push(
+            &mut ring,
+            EmittedJob {
+                job_id: "j1".into(),
+                patched_coinb1_bin: vec![1, 1, 1],
+                diff: 100,
+            },
+        );
+        ring_push(
+            &mut ring,
+            EmittedJob {
+                job_id: "j2".into(),
+                patched_coinb1_bin: vec![2, 2, 2],
+                diff: 200,
+            },
+        );
+        ring_push(
+            &mut ring,
+            EmittedJob {
+                job_id: "j3".into(),
+                patched_coinb1_bin: vec![3, 3, 3],
+                diff: 300,
+            },
+        );
+        // j1 is dropped; j2 and j3 remain (j3 most recent).
+        assert!(ring_lookup(&ring, "j1").is_none());
+        let two = ring_lookup(&ring, "j2").unwrap();
+        assert_eq!(two.diff, 200);
+        let three = ring_lookup(&ring, "j3").unwrap();
+        assert_eq!(three.diff, 300);
+    }
+
+    #[test]
+    fn patch_coinb1_bytes_matches_hex_patcher_at_pot_index() {
+        let coinb1 = vec![0x00, 0x11, 0x22, 0x33, 0x44, 0xff, 0x55, 0x66, 0x77];
+        let patched = patch_coinb1_bytes(&coinb1, 5, 1024);
+        assert_eq!(
+            patched,
+            vec![0x00, 0x11, 0x22, 0x33, 0x44, 0x0a, 0x55, 0x66, 0x77]
+        );
+        // No-op when index is 0 (test path).
+        let same = patch_coinb1_bytes(&coinb1, 0, 1024);
+        assert_eq!(same, coinb1);
+    }
+
+    #[tokio::test]
+    async fn submit_after_vardiff_bump_carries_pre_bump_snapshot() {
+        // Force a quick vardiff bump, then submit on the OLD job_id (after
+        // the new emit has been published). The share must carry the diff +
+        // patched coinb1 from the FIRST emit, not the post-bump emit.
+        let vardiff = VardiffParams {
+            min: 1,
+            target_shares_min: 8,
+            recheck_secs: 1,
+            max: 1u64 << 10,
+        };
+        let (addr, notify_tx, _shutdown_tx, mut submit_rx) =
+            spawn_server_with_vardiff(vardiff).await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (rd, mut wr) = stream.into_split();
+        let mut rd = BufReader::new(rd);
+
+        wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"v\"]}\n")
+            .await
+            .unwrap();
+        let _ = read_line(&mut rd).await; // subscribe response
+        let _ = read_line(&mut rd).await; // initial set_difficulty
+        wr.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"bc1q\",\"x\"]}\n")
+            .await
+            .unwrap();
+        let _ = read_line(&mut rd).await;
+
+        // Emit job-A with a coinb1 that has 0xff at index 5 and a non-zero
+        // target_pot_index so the patch + ring snapshot exercise.
+        let coinb1_a: Vec<u8> = vec![0xaa; 12];
+        let coinb1_a_hex = hex::encode(&coinb1_a);
+        let params_a = json!(["job-A", "00".repeat(32), coinb1_a_hex, "ee", []]);
+        notify_tx
+            .send(Some(NotifyJob::with_coinb1(
+                params_a,
+                5,
+                coinb1_a.clone(),
+                "job-A".into(),
+            )))
+            .unwrap();
+        let _ = read_line(&mut rd).await; // notify
+
+        // Hammer 32 submits to bump diff and force a re-emit.
+        for _ in 0..32u32 {
+            wr.write_all(
+                br#"{"id":99,"method":"mining.submit","params":["bc1q","job-A","00000000","6712f000","deadbeef"]}"#,
+            )
+            .await
+            .unwrap();
+            wr.write_all(b"\n").await.unwrap();
+        }
+        for _ in 0..32u32 {
+            let _ = submit_rx.recv().await.unwrap();
+            let _ = read_line(&mut rd).await; // submit ack
+        }
+
+        // Wait for vardiff bump (set_difficulty + re-emitted notify).
+        let line = tokio::time::timeout(std::time::Duration::from_secs(5), read_line(&mut rd))
+            .await
+            .expect("set_difficulty");
+        let v: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["method"], "mining.set_difficulty");
+        let new_diff = v["params"][0].as_u64().unwrap();
+        assert!(new_diff >= 2);
+        let _ = read_line(&mut rd).await; // re-emitted notify on job-A at new diff
+
+        // NOW submit on the old job_id "job-A" — this simulates an in-flight
+        // share started before the bump. It must carry the PRE-bump snapshot.
+        wr.write_all(
+            br#"{"id":100,"method":"mining.submit","params":["bc1q","job-A","00000000","6712f000","cafef00d"]}"#,
+        )
+        .await
+        .unwrap();
+        wr.write_all(b"\n").await.unwrap();
+        let _ = read_line(&mut rd).await;
+        let post_bump_share = submit_rx.recv().await.unwrap();
+        // The most recent emit-ring slot is the POST-bump emit (also job-A
+        // but at the new diff); the lookup matches by job_id and returns slot
+        // [0]. That's the post-bump snapshot (PoT byte = floor_pot(new_diff)).
+        // The race only manifests when the runtime emits a *different* job_id
+        // between bump and submit — exercise that next.
+        assert_eq!(post_bump_share.current_diff, new_diff);
+        let snap = post_bump_share
+            .patched_coinb1_bin
+            .expect("snapshot must be populated for known job_id");
+        assert_eq!(snap[5], floor_pot(new_diff));
+
+        // Now publish a NEW job-B (forcing job-A into ring slot [1]) and
+        // submit on the OLD job-A. The lookup falls back to slot [1] and
+        // recovers the pre-emit-B snapshot for job-A (still at new_diff
+        // because that was the diff at job-A's last emit).
+        let coinb1_b: Vec<u8> = vec![0xbb; 12];
+        let coinb1_b_hex = hex::encode(&coinb1_b);
+        let params_b = json!(["job-B", "00".repeat(32), coinb1_b_hex, "ee", []]);
+        notify_tx
+            .send(Some(NotifyJob::with_coinb1(
+                params_b,
+                5,
+                coinb1_b.clone(),
+                "job-B".into(),
+            )))
+            .unwrap();
+        let _ = read_line(&mut rd).await; // job-B notify
+
+        wr.write_all(
+            br#"{"id":101,"method":"mining.submit","params":["bc1q","job-A","00000000","6712f000","cafef00e"]}"#,
+        )
+        .await
+        .unwrap();
+        wr.write_all(b"\n").await.unwrap();
+        let _ = read_line(&mut rd).await;
+        let stale_share = submit_rx.recv().await.unwrap();
+        // Carry the diff from job-A's last emit, not job-B's diff.
+        assert_eq!(stale_share.current_diff, new_diff);
+        let snap = stale_share
+            .patched_coinb1_bin
+            .expect("ring slot[1] still has job-A");
+        // The snapshot is built from coinb1_a (0xaa filler), patched at idx 5.
+        assert_eq!(snap[0], 0xaa);
+        assert_eq!(snap[5], floor_pot(new_diff));
+    }
+
+    #[tokio::test]
+    async fn submit_for_unknown_job_id_has_none_snapshot() {
+        let (addr, _notify_tx, _shutdown_tx, mut submit_rx) = spawn_server_with_submit().await;
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (rd, mut wr) = stream.into_split();
+        let mut rd = BufReader::new(rd);
+
+        wr.write_all(b"{\"id\":1,\"method\":\"mining.subscribe\",\"params\":[\"v\"]}\n")
+            .await
+            .unwrap();
+        let _ = read_line(&mut rd).await;
+        let _ = read_line(&mut rd).await;
+        wr.write_all(b"{\"id\":2,\"method\":\"mining.authorize\",\"params\":[\"bc1q\",\"x\"]}\n")
+            .await
+            .unwrap();
+        let _ = read_line(&mut rd).await;
+
+        wr.write_all(
+            b"{\"id\":3,\"method\":\"mining.submit\",\"params\":[\"bc1q\",\"never-emitted\",\"00000000\",\"6712f000\",\"deadbeef\"]}\n",
+        )
+        .await
+        .unwrap();
+        let _ = read_line(&mut rd).await;
+        let share = submit_rx.recv().await.unwrap();
+        assert!(share.patched_coinb1_bin.is_none());
     }
 }

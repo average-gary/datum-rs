@@ -102,10 +102,34 @@ fn our_format_level_strings_match_c_outputs() {
 fn our_format_function_name_is_44_padded() {
     let s = format_function_name("datum_protocol_init");
     assert_eq!(s.len(), FUNCTION_NAME_PAD);
-    // C right-pads with leading spaces (right-aligned). Our output is
-    // left-aligned (the func name comes first, spaces trail). Both are
-    // length-FUNCTION_NAME_PAD, both produce a 44-char slot. Document that
-    // operator grep alignment uses `[xxx]` boundaries, not interior
-    // alignment.
-    assert!(s.starts_with("datum_protocol_init") || s.ends_with("datum_protocol_init"));
+    // C right-aligns the function name within the 44-char slot
+    // (`printf("%44s", func)`). Our formatter matches.
+    assert!(s.ends_with("datum_protocol_init"));
+    assert!(s.starts_with(' '));
+}
+
+#[test]
+fn fixture_function_name_is_right_aligned_matching_our_formatter() {
+    // Pin the byte-exact alignment against the captured C fixture. Each line
+    // has a single `[func_padded_44]` slot; the func name lives at the
+    // RIGHT edge of the bracket. Our formatter must produce identical bytes
+    // for the inner-bracket region given the same input.
+    for line in FIXTURE.lines() {
+        if line.is_empty() {
+            continue;
+        }
+        let after_ts = &line[24..]; // skip "YYYY-MM-DD HH:MM:SS.mmm "
+        let lb = after_ts.find('[').expect("opening bracket");
+        let rb = after_ts.find(']').expect("closing bracket");
+        let inside = &after_ts[lb + 1..rb];
+        assert_eq!(inside.len(), FUNCTION_NAME_PAD);
+        let trimmed = inside.trim_start();
+        assert!(
+            !trimmed.is_empty() && !trimmed.starts_with(' '),
+            "func name should sit flush-right in the slot"
+        );
+        // Round-trip: feed the trimmed name through our formatter and expect
+        // byte-equal output.
+        assert_eq!(format_function_name(trimmed), inside);
+    }
 }

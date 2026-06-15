@@ -27,5 +27,6 @@ datum-submitblock = { path = "../datum-submitblock" }
 hex = { workspace = true }
 parking_lot = "0.12"
 serde_json = { workspace = true }
+sha2 = "0.10"
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -142,6 +142,18 @@ pub struct JobMeta {
     pub txn_total_size: u32,
     /// Total sigops across all transactions.
     pub txn_total_sigops: u32,
+    /// Network block target in INTERNAL little-endian byte order
+    /// (`target[0]` is the LSB). Decoded from GBT's `target` field
+    /// (big-endian display hex, reversed) or derived from `nbits` if
+    /// absent. Used by the share-relay's block-found check to compare
+    /// the candidate header hash against the network target with the
+    /// same byte-walk semantics as `datum_utils.c::compare_hashes`.
+    pub block_target: [u8; 32],
+    /// Hex-encoded `data` field of every transaction in the template,
+    /// shared via Arc so all 256 JobEntries pointing at the same template
+    /// share one allocation. Snapshotted at notify-build time so block_hex
+    /// assembly doesn't need the original Template Arc at submit time.
+    pub txn_data_hex: std::sync::Arc<Vec<String>>,
 }
 
 impl NotifyParams {
@@ -253,6 +265,29 @@ pub fn assemble_notify_meta(
         .sum();
     let txn_total_sigops: u32 = template.transactions.iter().map(|t| t.sigops).sum();
 
+    // Block target: prefer GBT-supplied target (big-endian display hex);
+    // reverse to internal-LE for byte-wise compare. Fall back to deriving
+    // from `nbits` when absent — matches C reference which always recomputes
+    // via nbits_to_target.
+    let block_target: [u8; 32] = template
+        .target
+        .as_deref()
+        .and_then(|hex_be| hex::decode(hex_be).ok())
+        .and_then(|v| <[u8; 32]>::try_from(v.as_slice()).ok())
+        .map(|mut a| {
+            a.reverse();
+            a
+        })
+        .unwrap_or_else(|| nbits_to_target_le(&template.bits));
+
+    let txn_data_hex = std::sync::Arc::new(
+        template
+            .transactions
+            .iter()
+            .map(|t| t.data.clone())
+            .collect::<Vec<_>>(),
+    );
+
     let notify = NotifyParams {
         job_id: job_id.to_string(),
         prev_hash,
@@ -281,8 +316,38 @@ pub fn assemble_notify_meta(
         txn_total_weight,
         txn_total_size,
         txn_total_sigops,
+        block_target,
+        txn_data_hex,
     };
     (notify, meta)
+}
+
+/// Decode `nbits` (big-endian display hex from GBT) into a 32-byte target in
+/// internal little-endian byte order. Mirrors `datum_utils.c::nbits_to_target`:
+/// the high byte is the exponent; the low three bytes are the 24-bit
+/// mantissa. The mantissa is written into bytes `target[exp-3 .. exp]`
+/// little-endian; the rest of the array stays zero. Returns all-zero on a
+/// malformed `nbits_hex` (which means "no share can satisfy" — safe default).
+pub fn nbits_to_target_le(nbits_hex: &str) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let bytes = match hex::decode(nbits_hex) {
+        Ok(b) if b.len() == 4 => b,
+        _ => return out,
+    };
+    let nbits = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let exp = (nbits >> 24) as usize;
+    let mantissa = nbits & 0x00FF_FFFF;
+    if !(3..=32).contains(&exp) {
+        return out;
+    }
+    let base = exp - 3;
+    if base + 3 > 32 {
+        return out;
+    }
+    out[base] = (mantissa & 0xFF) as u8;
+    out[base + 1] = ((mantissa >> 8) & 0xFF) as u8;
+    out[base + 2] = ((mantissa >> 16) & 0xFF) as u8;
+    out
 }
 
 /// SV1 `prev_hash` field is the GBT `previousblockhash` with **internal-byte
@@ -855,5 +920,71 @@ mod tests {
             hex::encode(h),
             "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"
         );
+    }
+
+    #[test]
+    fn nbits_to_target_le_difficulty_one() {
+        // nbits "1d00ffff" — the canonical difficulty-1 target.
+        // Internal-LE result: 0xffff at exp-3..exp = 26..29; rest zero.
+        let t = nbits_to_target_le("1d00ffff");
+        // Bytes 26 = 0xff, 27 = 0xff, 28 = 0x00. (mantissa 0x00ffff little-endian.)
+        assert_eq!(t[26], 0xff);
+        assert_eq!(t[27], 0xff);
+        assert_eq!(t[28], 0x00);
+        // Top byte (MSB) is zero — difficulty-1 doesn't reach.
+        assert_eq!(t[31], 0x00);
+    }
+
+    #[test]
+    fn nbits_to_target_le_regtest() {
+        // nbits "207fffff" — regtest max target. exp = 0x20 = 32, mantissa
+        // 0x7fffff. Bytes 29,30,31 = 0xff,0xff,0x7f.
+        let t = nbits_to_target_le("207fffff");
+        assert_eq!(t[29], 0xff);
+        assert_eq!(t[30], 0xff);
+        assert_eq!(t[31], 0x7f);
+    }
+
+    #[test]
+    fn nbits_to_target_le_malformed_returns_zero() {
+        let t = nbits_to_target_le("zz");
+        assert_eq!(t, [0u8; 32]);
+    }
+
+    #[test]
+    fn block_target_decoded_from_template_target_field() {
+        let mut t = template();
+        // Set a specific BE-display target hex; expect LE-internal in JobMeta.
+        t.target = Some("00000000000000000000000000000000000000000000000000000000000000ff".into());
+        let (_n, meta) = assemble_notify_meta(
+            "j",
+            0,
+            0,
+            &t,
+            &p2pkh_blob(),
+            ScriptSigInputs::default(),
+            true,
+        );
+        // BE display puts 0xff at the END; LE internal puts it at index 0.
+        assert_eq!(meta.block_target[0], 0xff);
+        for &b in &meta.block_target[1..] {
+            assert_eq!(b, 0x00);
+        }
+    }
+
+    #[test]
+    fn block_target_falls_back_to_nbits_when_target_absent() {
+        let t = template();
+        assert!(t.target.is_none());
+        let (_n, meta) = assemble_notify_meta(
+            "j",
+            0,
+            0,
+            &t,
+            &p2pkh_blob(),
+            ScriptSigInputs::default(),
+            true,
+        );
+        assert_eq!(meta.block_target, nbits_to_target_le(&t.bits));
     }
 }

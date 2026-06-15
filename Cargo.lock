@@ -337,6 +337,7 @@ dependencies = [
  "hex",
  "parking_lot",
  "serde_json",
+ "sha2 0.10.9",
  "tokio",
  "tracing",
 ]

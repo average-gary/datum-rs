@@ -37,12 +37,15 @@ pub fn format_level(level: Level) -> &'static str {
     }
 }
 
-/// Right-pad or truncate a function/target name to `FUNCTION_NAME_PAD` chars.
+/// Left-pad (right-align) or truncate a function/target name to
+/// `FUNCTION_NAME_PAD` chars. C's `printf("%44s", func)` right-aligns;
+/// matching that lets fixed-column operator grep pipelines key on the
+/// trailing edge of the bracket slot.
 pub fn format_function_name(name: &str) -> String {
     if name.len() >= FUNCTION_NAME_PAD {
         name[..FUNCTION_NAME_PAD].to_string()
     } else {
-        format!("{name:<FUNCTION_NAME_PAD$}")
+        format!("{name:>FUNCTION_NAME_PAD$}")
     }
 }
 
@@ -112,7 +115,7 @@ mod tests {
     fn function_name_padded() {
         let s = format_function_name("foo");
         assert_eq!(s.len(), FUNCTION_NAME_PAD);
-        assert!(s.starts_with("foo"));
+        assert!(s.ends_with("foo"));
     }
 
     #[test]
