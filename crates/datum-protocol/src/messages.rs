@@ -50,12 +50,13 @@ pub const SHARE_RESPONSE_OPCODE: u8 = 0x8F;
 /// See `datum_protocol.c:944-948`.
 pub const JOB_VALIDATION_OPCODE: u8 = 0x50;
 
-/// Share-response status: accepted.
-pub const SHARE_ACCEPTED: u8 = 0x01;
+/// Share-response status: accepted. C reference `datum_protocol.h:168`.
+pub const SHARE_ACCEPTED: u8 = 0x50;
 /// Share-response status: tentatively accepted (typically a low-PoW share).
-pub const SHARE_ACCEPTED_TENTATIVELY: u8 = 0x02;
-/// Share-response status: rejected.
-pub const SHARE_REJECTED: u8 = 0x80;
+/// C reference `datum_protocol.h:169`.
+pub const SHARE_ACCEPTED_TENTATIVELY: u8 = 0x55;
+/// Share-response status: rejected. C reference `datum_protocol.h:170`.
+pub const SHARE_REJECTED: u8 = 0x66;
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum MessageError {
