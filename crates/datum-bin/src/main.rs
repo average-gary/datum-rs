@@ -213,6 +213,11 @@ async fn run_async(cfg: Config) {
         let jobs_for_assembler = jobs.clone();
         tokio::spawn(async move {
             let mut tick: u32 = 0;
+            // Per-job 2-byte enprefix counter, XOR'd with 0xB10C — mirrors
+            // `stratum_enprefix ^ 0xB10C` in datum_stratum.c:71, 2030-2031.
+            // Wraps at u16. Distinguishes consecutive jobs in the coinbase
+            // scriptsig so OCEAN doesn't see duplicate-work patterns.
+            let mut enprefix_counter: u16 = 0;
             // Coinbase variant — our SV1 server doesn't multi-coinbase (yet);
             // OCEAN's pool dispatches up to 8 in the C reference. Use 0 for
             // every emitted notify so the relay/upstream side stays consistent.
@@ -246,13 +251,15 @@ async fn run_async(cfg: Config) {
                     (template.height as u16) ^ 0xC0DE
                 );
                 let job_id = format!("{head}{COINBASE_ID:02x}");
+                let enprefix = enprefix_counter ^ 0xB10C;
+                enprefix_counter = enprefix_counter.wrapping_add(1);
                 let scriptsig = datum_stratum_sv1::assembler::ScriptSigInputs {
                     coinbase_tag_primary: coinbase_tag_primary.as_str(),
                     coinbase_tag_secondary: coinbase_tag_secondary.as_str(),
                     // Config field is u32 for forward-compat; the C reference's
                     // uid push only stores 2 bytes — truncate.
                     coinbase_unique_id: coinbase_unique_id as u16,
-                    enprefix: 0,
+                    enprefix,
                     pot_placeholder: 0xFF,
                 };
                 let (params, meta) = datum_stratum_sv1::assembler::assemble_notify_meta(
