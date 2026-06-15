@@ -15,9 +15,28 @@ use crate::{extranonce1, StratumRequest, StratumResponse};
 /// rolling. Any miner-requested mask is ANDed with this before being acked.
 const POOL_VERSION_MASK: u32 = 0x1fffe000;
 
-/// Inbound notify payload from the runtime: a fully-pre-built `mining.notify`
-/// params array. Phase 3 punts coinbase + merkle synthesis up the call stack;
-/// the SV1 server just relays whatever the runtime publishes.
+/// Inbound notify job from the runtime: the pre-built `mining.notify` params
+/// JSON array plus the byte offset within `coinb1` where the PoT placeholder
+/// lives. The server patches the placeholder byte to `floor_pot(current_diff)`
+/// per-miner before sending — the C reference does the same in
+/// `datum_stratum.c:1597-1598`. A `target_pot_index` of 0 disables patching
+/// (used by tests with synthetic params).
+#[derive(Debug, Clone)]
+pub struct NotifyJob {
+    pub params: Value,
+    pub target_pot_index: u16,
+}
+
+impl NotifyJob {
+    pub fn new(params: Value, target_pot_index: u16) -> Self {
+        Self {
+            params,
+            target_pot_index,
+        }
+    }
+}
+
+/// Compatibility alias for callers that already speak the JSON-array shape.
 pub type NotifyParams = Value;
 
 /// Forwarded share-submit, populated when a miner sends `mining.submit`.
@@ -71,13 +90,13 @@ impl Default for VardiffParams {
 pub struct ServerState {
     pub thread_id: u16,
     pub client_id: Arc<AtomicU32>,
-    pub notify_rx: watch::Receiver<Option<NotifyParams>>,
+    pub notify_rx: watch::Receiver<Option<NotifyJob>>,
     pub submit_tx: Option<tokio::sync::mpsc::Sender<SubmittedShare>>,
     pub vardiff: VardiffParams,
 }
 
 impl ServerState {
-    pub fn new(notify_rx: watch::Receiver<Option<NotifyParams>>) -> Self {
+    pub fn new(notify_rx: watch::Receiver<Option<NotifyJob>>) -> Self {
         Self {
             thread_id: 0,
             client_id: Arc::new(AtomicU32::new(0)),
@@ -325,8 +344,8 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                         .await?;
                         authorized = true;
                         let pending = notify_rx.borrow().clone();
-                        if let Some(params) = pending {
-                            send_notify(&mut wr, &params).await?;
+                        if let Some(job) = pending {
+                            send_notify(&mut wr, &job, current_diff).await?;
                         }
                     }
                     "mining.submit" => {
@@ -443,8 +462,8 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                 }
                 if subscribed && authorized {
                     let pending = notify_rx.borrow_and_update().clone();
-                    if let Some(params) = pending {
-                        send_notify(&mut wr, &params).await?;
+                    if let Some(job) = pending {
+                        send_notify(&mut wr, &job, current_diff).await?;
                     }
                 }
             }
@@ -476,6 +495,17 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                         diff = current_diff,
                         "vardiff: diff changed"
                     );
+                    // C reference rebuilds coinb1 per-miner with the new PoT
+                    // byte and re-emits the current notify (datum_stratum.c
+                    // calls send_mining_notify on diff change). Mirror that —
+                    // otherwise the miner keeps hashing the OLD PoT byte until
+                    // the next template lands.
+                    if authorized {
+                        let pending = notify_rx.borrow().clone();
+                        if let Some(job) = pending {
+                            send_notify(&mut wr, &job, current_diff).await?;
+                        }
+                    }
                 }
                 shares_since_snap = 0;
                 last_snap = tokio::time::Instant::now();
@@ -538,8 +568,10 @@ async fn write_response<W: AsyncWriteExt + Unpin>(
 
 async fn send_notify<W: AsyncWriteExt + Unpin>(
     wr: &mut W,
-    params: &NotifyParams,
+    job: &NotifyJob,
+    current_diff: u64,
 ) -> std::io::Result<()> {
+    let params = patch_coinb1_pot_byte(&job.params, job.target_pot_index, current_diff);
     let frame = json!({
         "id": Value::Null,
         "method": "mining.notify",
@@ -548,6 +580,53 @@ async fn send_notify<W: AsyncWriteExt + Unpin>(
     let mut s = serde_json::to_string(&frame).unwrap();
     s.push('\n');
     wr.write_all(s.as_bytes()).await
+}
+
+/// Patch the PoT placeholder byte inside `coinb1` (params index 2) at
+/// `target_pot_index` to `floor_pot(current_diff)`. The miner hashes the
+/// scriptsig; OCEAN re-hashes the same scriptsig server-side and compares the
+/// PoT byte against the per-miner diff. Mirrors `datum_stratum.c:1597-1598`.
+///
+/// `target_pot_index == 0` is treated as "no patch needed" (tests construct
+/// synthetic params; the real assembler always emits a non-zero index because
+/// coinb1 starts with the version+prev_hash header).
+fn patch_coinb1_pot_byte(params: &Value, target_pot_index: u16, current_diff: u64) -> Value {
+    if target_pot_index == 0 {
+        return params.clone();
+    }
+    let mut params = params.clone();
+    let Some(arr) = params.as_array_mut() else {
+        return params;
+    };
+    let Some(coinb1_v) = arr.get_mut(2) else {
+        return params;
+    };
+    let Some(coinb1_hex) = coinb1_v.as_str() else {
+        return params;
+    };
+    let hex_offset = (target_pot_index as usize) * 2;
+    if hex_offset + 2 > coinb1_hex.len() {
+        return params;
+    }
+    let pot = floor_pot(current_diff);
+    let patched = format!(
+        "{}{:02x}{}",
+        &coinb1_hex[..hex_offset],
+        pot,
+        &coinb1_hex[hex_offset + 2..]
+    );
+    *coinb1_v = Value::String(patched);
+    params
+}
+
+/// `floorPoT(x)`: position of the highest set bit; 0 for x=0. Mirrors
+/// `datum_utils.c::floorPoT`.
+fn floor_pot(x: u64) -> u8 {
+    if x == 0 {
+        0
+    } else {
+        (63 - x.leading_zeros()) as u8
+    }
 }
 
 async fn send_set_difficulty<W: AsyncWriteExt + Unpin>(
@@ -591,7 +670,7 @@ mod tests {
 
     async fn spawn_server() -> (
         std::net::SocketAddr,
-        watch::Sender<Option<NotifyParams>>,
+        watch::Sender<Option<NotifyJob>>,
         watch::Sender<bool>,
     ) {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -605,7 +684,7 @@ mod tests {
 
     async fn spawn_server_with_submit() -> (
         std::net::SocketAddr,
-        watch::Sender<Option<NotifyParams>>,
+        watch::Sender<Option<NotifyJob>>,
         watch::Sender<bool>,
         tokio::sync::mpsc::Receiver<SubmittedShare>,
     ) {
@@ -623,7 +702,7 @@ mod tests {
         vardiff: VardiffParams,
     ) -> (
         std::net::SocketAddr,
-        watch::Sender<Option<NotifyParams>>,
+        watch::Sender<Option<NotifyJob>>,
         watch::Sender<bool>,
         tokio::sync::mpsc::Receiver<SubmittedShare>,
     ) {
@@ -637,6 +716,32 @@ mod tests {
             .with_vardiff(vardiff);
         tokio::spawn(run(listener, state, shutdown_rx));
         (addr, notify_tx, shutdown_tx, submit_rx)
+    }
+
+    #[test]
+    fn patch_coinb1_writes_floor_pot_at_target_index() {
+        // coinb1 hex: 9 bytes — `00 11 22 33 44 ff 55 66 77`. The byte at
+        // index 5 is the 0xff placeholder. floor_pot(1024)=10 → 0x0a.
+        let params = json!(["job-1", "00".repeat(32), "001122334455667788", "ee", []]);
+        let patched = patch_coinb1_pot_byte(&params, 5, 1024);
+        let coinb1 = patched[2].as_str().unwrap();
+        assert_eq!(coinb1, "00112233440a667788");
+    }
+
+    #[test]
+    fn patch_coinb1_no_op_when_index_zero() {
+        let params = json!(["j", "00".repeat(32), "deadbeef", "ee", []]);
+        let same = patch_coinb1_pot_byte(&params, 0, 1024);
+        assert_eq!(same, params);
+    }
+
+    #[test]
+    fn floor_pot_matches_c_reference() {
+        assert_eq!(floor_pot(0), 0);
+        assert_eq!(floor_pot(1), 0);
+        assert_eq!(floor_pot(2), 1);
+        assert_eq!(floor_pot(1024), 10);
+        assert_eq!(floor_pot(0xFFFF_FFFF), 31);
     }
 
     async fn read_line<R: AsyncBufReadExt + Unpin>(r: &mut R) -> String {
@@ -681,7 +786,9 @@ mod tests {
 
         // server publishes a notify; client should receive it
         let params = json!(["job-1", "00".repeat(32), "01", "02", []]);
-        notify_tx.send(Some(params.clone())).unwrap();
+        notify_tx
+            .send(Some(NotifyJob::new(params.clone(), 0)))
+            .unwrap();
         let line = read_line(&mut rd).await;
         let v: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(v["method"], "mining.notify");
@@ -843,7 +950,9 @@ mod tests {
         let _ = read_line(&mut rd).await;
 
         let params = json!(["job-1", "00".repeat(32), "01", "02", []]);
-        notify_tx.send(Some(params.clone())).unwrap();
+        notify_tx
+            .send(Some(NotifyJob::new(params.clone(), 0)))
+            .unwrap();
         let _ = read_line(&mut rd).await; // notify
 
         wr.write_all(
@@ -887,7 +996,9 @@ mod tests {
         let _ = read_line(&mut rd).await;
 
         let params = json!(["job-1", "00".repeat(32), "01", "02", []]);
-        notify_tx.send(Some(params.clone())).unwrap();
+        notify_tx
+            .send(Some(NotifyJob::new(params.clone(), 0)))
+            .unwrap();
         let _ = read_line(&mut rd).await;
 
         wr.write_all(
@@ -919,7 +1030,9 @@ mod tests {
         let _ = read_line(&mut rd).await;
 
         let params = json!(["job-1", "00".repeat(32), "01", "02", []]);
-        notify_tx.send(Some(params.clone())).unwrap();
+        notify_tx
+            .send(Some(NotifyJob::new(params.clone(), 0)))
+            .unwrap();
         let _ = read_line(&mut rd).await;
 
         wr.write_all(
@@ -989,7 +1102,9 @@ mod tests {
         let _ = read_line(&mut rd).await;
 
         let params = json!(["job-1", "00".repeat(32), "01", "02", []]);
-        notify_tx.send(Some(params.clone())).unwrap();
+        notify_tx
+            .send(Some(NotifyJob::new(params.clone(), 0)))
+            .unwrap();
         let _ = read_line(&mut rd).await; // notify
 
         for _ in 0..32u32 {
@@ -1034,7 +1149,9 @@ mod tests {
         let _ = read_line(&mut rd).await;
 
         let params = json!(["job-1", "00".repeat(32), "01", "02", []]);
-        notify_tx.send(Some(params.clone())).unwrap();
+        notify_tx
+            .send(Some(NotifyJob::new(params.clone(), 0)))
+            .unwrap();
         let _ = read_line(&mut rd).await;
 
         wr.write_all(

@@ -114,7 +114,7 @@ async fn run_async(cfg: Config) {
     // pair lands. Phase 4 wires the publisher; today the channel stays empty
     // and clients block until the gateway gets real templates.
     let (notify_tx, notify_rx) =
-        tokio::sync::watch::channel::<Option<datum_stratum_sv1::server::NotifyParams>>(None);
+        tokio::sync::watch::channel::<Option<datum_stratum_sv1::server::NotifyJob>>(None);
     let (sv1_shutdown_tx, sv1_shutdown_rx) = tokio::sync::watch::channel::<bool>(false);
     let (submit_tx, mut submit_rx) =
         tokio::sync::mpsc::channel::<datum_stratum_sv1::server::SubmittedShare>(64);
@@ -264,14 +264,16 @@ async fn run_async(cfg: Config) {
                     scriptsig,
                     true,
                 );
+                let target_pot_index = meta.target_pot_index;
                 {
                     let mut g = jobs_for_assembler.lock().await;
                     g.insert(job_id.clone(), meta);
                 }
-                if notify_tx_for_assembler
-                    .send(Some(params.to_json_array()))
-                    .is_err()
-                {
+                let job = datum_stratum_sv1::server::NotifyJob::new(
+                    params.to_json_array(),
+                    target_pot_index,
+                );
+                if notify_tx_for_assembler.send(Some(job)).is_err() {
                     return;
                 }
                 tick = tick.wrapping_add(1);
