@@ -832,6 +832,15 @@ fn build_share_submission(
 
     // 0x02 sub-block: full coinb1/coinb2 binaries. Sent once per (job,
     // coinbase_id) until server has it.
+    //
+    // CRITICAL: the miner hashed coinb1 with the PoT byte patched in
+    // (server.rs::patch_coinb1_pot_byte). The pool's BAD_TARGET (reject_reason
+    // 13) check scans the coinb1 we send here for the PoT byte at
+    // target_pot_index and compares against the `target_byte` field of the
+    // 0x27 prefix. So coinb1_bin must carry the SAME patched byte the miner
+    // hashed — not the 0xFF placeholder. We patch it locally here before
+    // emitting (the un-patched binary stays in JobMeta so subsequent shares
+    // at a different diff still patch from a clean baseline).
     let cb_id = entry.meta.coinbase_id as usize;
     let already_sent_coinbase =
         cb_id < entry.server_has_coinbase.len() && entry.server_has_coinbase[cb_id];
@@ -842,7 +851,12 @@ fn build_share_submission(
         let cb2_len = entry.meta.coinb2_bin.len() as u16;
         body.extend_from_slice(&cb1_len.to_le_bytes());
         body.extend_from_slice(&cb2_len.to_le_bytes());
-        body.extend_from_slice(&entry.meta.coinb1_bin);
+        let mut coinb1_patched = entry.meta.coinb1_bin.clone();
+        let pot_index = entry.meta.target_pot_index as usize;
+        if pot_index < coinb1_patched.len() {
+            coinb1_patched[pot_index] = target_byte;
+        }
+        body.extend_from_slice(&coinb1_patched);
         body.extend_from_slice(&entry.meta.coinb2_bin);
         if cb_id < entry.server_has_coinbase.len() {
             entry.server_has_coinbase[cb_id] = true;
