@@ -96,8 +96,14 @@ pub enum UpstreamCommand {
     /// Submit a share. Body is the full encoded ShareSubmissionPrefix +
     /// (optional) merkle-branch suffix the runtime computed.
     SubmitShare(Vec<u8>),
-    /// Request a coinbaser refresh. Body is `[COINBASER_FETCH_OPCODE]`.
-    RequestCoinbaser,
+    /// Request a coinbase split for the current job. Per
+    /// `datum_protocol.c::datum_protocol_coinbaser_fetch:320-354`, the body
+    /// is `[0x10][coinbase_value LE u64][prevhash_bin 32B][0xFE][padding]`
+    /// sent via mining cmd (proto_cmd=5, is_encrypted_channel=true).
+    RequestCoinbaser {
+        coinbase_value: u64,
+        prevhash_bin: [u8; 32],
+    },
     /// Send a verbatim frame (`proto_cmd`, body). Escape hatch for paths the
     /// runtime later realizes it needs.
     Raw { proto_cmd: u8, body: Vec<u8> },
@@ -140,6 +146,10 @@ impl DatumClient {
             .map_err(|_| ClientError::RecvTimeout(timeout_dur))??;
         let mut recv_obf = HeaderObfuscator::for_receiver(nk);
         let resp_header = parse_received_header(&mut recv_obf, header_buf)?;
+        // recv_obf has now advanced one position; we MUST hand it to the
+        // Connected struct so subsequent frames continue the chain
+        // correctly. Do NOT create a fresh `for_receiver(nk)` — that would
+        // reset the chain by one and desync against the pool.
 
         if resp_header.cmd_len > 4 * 1024 * 1024 {
             return Err(ClientError::OversizedResponse {
@@ -197,7 +207,7 @@ impl DatumClient {
             rd: Arc::new(Mutex::new(rd)),
             wr: Arc::new(Mutex::new(wr)),
             sender_obf: Mutex::new(HeaderObfuscator::for_sender(nk)),
-            receiver_obf: Mutex::new(HeaderObfuscator::for_receiver(nk)),
+            receiver_obf: Mutex::new(recv_obf),
             precomp_key: precomp,
             sender_nonce: Mutex::new(sender_nonce),
             receiver_nonce: Mutex::new(receiver_nonce),
@@ -273,21 +283,64 @@ impl Connected {
             obf.decrypt(wire_word)
         };
         let header = FrameHeader::unpack(plain_word.to_le_bytes());
-        if header.cmd_len > 4 * 1024 * 1024 {
+        tracing::debug!(
+            proto_cmd = format!("{:#04x}", header.proto_cmd),
+            cmd_len = header.cmd_len,
+            is_signed = header.is_signed,
+            is_encrypted_pubkey = header.is_encrypted_pubkey,
+            is_encrypted_channel = header.is_encrypted_channel,
+            "recv_frame: header"
+        );
+        if header.cmd_len > 16 * 1024 * 1024 {
             return Err(ClientError::OversizedResponse {
                 got: header.cmd_len,
             });
         }
-        let mut sealed = vec![0u8; header.cmd_len as usize];
-        rd.read_exact(&mut sealed).await?;
+        let mut raw = vec![0u8; header.cmd_len as usize];
+        rd.read_exact(&mut raw).await?;
         drop(rd);
 
-        let mut nonce = self.receiver_nonce.lock().await;
-        let plaintext = self
-            .crypto
-            .box_open_easy_afternm(&self.precomp_key, &nonce, &sealed)?;
-        increment_nonce(&mut nonce);
-        Ok((header, plaintext))
+        // Three body modes per datum_protocol.c::datum_protocol_server_msg:
+        // - encrypted_pubkey=1, encrypted_channel=0 → sealed-to-our-session-x25519
+        // - encrypted_pubkey=0, encrypted_channel=1 → secretbox via precomputed key
+        // - both=0 → no body encryption (signature-only or plaintext)
+        let mut body = if header.is_encrypted_pubkey && !header.is_encrypted_channel {
+            // sealed to our session pubkey — but we've thrown away the
+            // session keypair after handshake. The only sealed-pubkey
+            // frame we expect is the handshake response, which is handled
+            // in DatumClient::connect, not here. Treat as plaintext for
+            // now and surface the bytes.
+            tracing::warn!(
+                "recv_frame: encrypted_pubkey body without our session keypair; passing through"
+            );
+            raw
+        } else if !header.is_encrypted_pubkey && header.is_encrypted_channel {
+            let mut nonce = self.receiver_nonce.lock().await;
+            let pt = self
+                .crypto
+                .box_open_easy_afternm(&self.precomp_key, &nonce, &raw)?;
+            increment_nonce(&mut nonce);
+            pt
+        } else {
+            raw
+        };
+
+        // Strip detached signature suffix if present. Per
+        // datum_protocol.c:1213-1233 the signature is the LAST 64 bytes of
+        // the (decrypted) body and we strip it before dispatching. We don't
+        // verify it today — that's a TODO once we wire pool_session_ed25519
+        // through to here.
+        if header.is_signed && body.len() >= 64 {
+            body.truncate(body.len() - 64);
+        }
+
+        tracing::debug!(
+            proto_cmd = format!("{:#04x}", header.proto_cmd),
+            body_len = body.len(),
+            first_bytes = %hex::encode(&body[..body.len().min(32)]),
+            "recv_frame: decoded body"
+        );
+        Ok((header, body))
     }
 
     /// Drive the loop. Decodes incoming frames into `UpstreamEvent`s,
@@ -303,8 +356,20 @@ impl Connected {
         let recv_handle: tokio::task::JoinHandle<Result<(), ClientError>> =
             tokio::spawn(async move {
                 loop {
-                    let (header, body) = recv_self.recv_frame().await?;
-                    let event = decode_event(header, body)?;
+                    let (header, body) = match recv_self.recv_frame().await {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "recv_frame failed; recv loop exiting");
+                            return Err(e);
+                        }
+                    };
+                    let event = match decode_event(header, body) {
+                        Ok(e) => e,
+                        Err(e) => {
+                            tracing::warn!(error = %e, "decode_event failed; recv loop exiting");
+                            return Err(e);
+                        }
+                    };
                     if recv_events.send(event).await.is_err() {
                         return Ok(());
                     }
@@ -314,10 +379,25 @@ impl Connected {
         while let Some(cmd) = commands_rx.recv().await {
             match cmd {
                 UpstreamCommand::SubmitShare(body) => {
-                    self.send_frame(0x27, &body).await?;
+                    // Share submissions go via mining cmd (proto_cmd=5) with
+                    // is_encrypted_channel=true. The body is the encoded
+                    // ShareSubmissionPrefix; the leading 0x27 sub-opcode is
+                    // included in `body` per messages::SHARE_SUBMISSION_PREFIX_LEN.
+                    self.send_frame(5, &body).await?;
                 }
-                UpstreamCommand::RequestCoinbaser => {
-                    self.send_frame(0x10, &[0x10]).await?;
+                UpstreamCommand::RequestCoinbaser {
+                    coinbase_value,
+                    prevhash_bin,
+                } => {
+                    let mut body = Vec::with_capacity(64);
+                    body.push(0x10);
+                    body.extend_from_slice(&coinbase_value.to_le_bytes());
+                    body.extend_from_slice(&prevhash_bin);
+                    body.push(0xFE);
+                    // Random pad 1-80 bytes per datum_protocol.c:346.
+                    let pad_len = 1 + (self.crypto.random_bytes(1)[0] as usize % 80);
+                    body.extend_from_slice(&self.crypto.random_bytes(pad_len));
+                    self.send_frame(5, &body).await?;
                 }
                 UpstreamCommand::Raw { proto_cmd, body } => {
                     self.send_frame(proto_cmd, &body).await?;

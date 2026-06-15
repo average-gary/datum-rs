@@ -227,6 +227,7 @@ async fn run_async(cfg: Config) {
         let pool_pubkey_hex = cfg.datum.pool_pubkey.clone();
         let mining_pool_address = cfg.mining.pool_address.clone();
         let coinbaser_pub = coinbaser_pub;
+        let template_ch_for_upstream = template_channel.clone();
         if !pool_host.is_empty() && !pool_pubkey_hex.is_empty() {
             tokio::spawn(async move {
                 if let Err(e) = run_datum_upstream(
@@ -235,6 +236,7 @@ async fn run_async(cfg: Config) {
                     &pool_pubkey_hex,
                     &mining_pool_address,
                     coinbaser_pub,
+                    template_ch_for_upstream,
                 )
                 .await
                 {
@@ -310,6 +312,7 @@ async fn run_datum_upstream(
     pool_pubkey_hex: &str,
     _mining_pool_address: &str,
     coinbaser_pub: datum_coinbaser::CoinbaserPublisher,
+    template_channel: Option<datum_blocktemplates::TemplateChannel>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool_pubkey =
         hex::decode(pool_pubkey_hex).map_err(|e| format!("decode pool pubkey hex: {e}"))?;
@@ -349,11 +352,44 @@ async fn run_datum_upstream(
                     tokio::spawn(async move { conn.run(events_tx, commands_rx).await })
                 };
 
-                let _ = commands_tx
-                    .send(datum_protocol::UpstreamCommand::RequestCoinbaser)
-                    .await;
+                // Per datum_protocol.c, the coinbaser fetch should be issued
+                // AFTER ClientConfig arrives (state 3). It also needs the
+                // current template's prevhash + coinbase_value. We track
+                // both and fire when both are ready.
+                let mut client_config_seen = false;
+                let mut coinbaser_requested = false;
 
-                while let Some(event) = events_rx.recv().await {
+                // If the template arrives before ClientConfig (or vice versa)
+                // we need a way to retry on the OTHER signal arriving. Watch
+                // the template channel in a side task; nudge `commands_tx`
+                // with a Raw passthrough that we ignore in the main loop just
+                // to wake the select. Actually simpler: poll inside the main
+                // loop alongside events.
+                let mut template_sub = template_channel.clone();
+
+                loop {
+                    let event = tokio::select! {
+                        e = events_rx.recv() => match e {
+                            Some(ev) => ev,
+                            None => break,
+                        },
+                        changed = async {
+                            if let Some(s) = &mut template_sub {
+                                s.changed().await.map(|_| ())
+                            } else {
+                                std::future::pending::<Result<(), _>>().await
+                            }
+                        } => {
+                            if changed.is_err() {
+                                continue;
+                            }
+                            if client_config_seen && !coinbaser_requested {
+                                maybe_request_coinbaser(&commands_tx, &template_channel, true).await;
+                                coinbaser_requested = true;
+                            }
+                            continue;
+                        }
+                    };
                     match event {
                         datum_protocol::UpstreamEvent::Coinbaser(resp) => {
                             tracing::info!(
@@ -379,6 +415,22 @@ async fn run_datum_upstream(
                                 vardiff_min = cfg.vardiff_min,
                                 "client_config received from pool"
                             );
+                            client_config_seen = true;
+                            if !coinbaser_requested {
+                                maybe_request_coinbaser(
+                                    &commands_tx,
+                                    &template_channel,
+                                    client_config_seen,
+                                )
+                                .await;
+                                if template_channel
+                                    .as_ref()
+                                    .and_then(|ch| ch.current())
+                                    .is_some()
+                                {
+                                    coinbaser_requested = true;
+                                }
+                            }
                         }
                         datum_protocol::UpstreamEvent::ShareResponse(resp) => {
                             tracing::debug!(?resp, "share response");
@@ -386,11 +438,20 @@ async fn run_datum_upstream(
                         datum_protocol::UpstreamEvent::BlockNotify(_) => {
                             tracing::info!("block_notify from pool");
                         }
-                        datum_protocol::UpstreamEvent::JobValidationRequest(_) => {
-                            tracing::debug!("job validation request from pool (not yet handled)");
+                        datum_protocol::UpstreamEvent::JobValidationRequest(body) => {
+                            tracing::info!(
+                                body_len = body.len(),
+                                first_bytes = %hex::encode(&body[..body.len().min(16)]),
+                                "job validation request from pool (not yet handled)"
+                            );
                         }
-                        datum_protocol::UpstreamEvent::UnknownFrame { proto_cmd, .. } => {
-                            tracing::debug!(?proto_cmd, "unknown frame from pool");
+                        datum_protocol::UpstreamEvent::UnknownFrame { proto_cmd, body } => {
+                            tracing::info!(
+                                proto_cmd = format!("{proto_cmd:#04x}"),
+                                body_len = body.len(),
+                                first_bytes = %hex::encode(&body[..body.len().min(32)]),
+                                "unknown frame from pool"
+                            );
                         }
                     }
                 }
@@ -402,6 +463,50 @@ async fn run_datum_upstream(
             }
         }
         tokio::time::sleep(backoff).await;
+    }
+}
+
+async fn maybe_request_coinbaser(
+    commands_tx: &tokio::sync::mpsc::Sender<datum_protocol::UpstreamCommand>,
+    template_channel: &Option<datum_blocktemplates::TemplateChannel>,
+    client_config_seen: bool,
+) {
+    if !client_config_seen {
+        return;
+    }
+    let Some(template_ch) = template_channel else {
+        tracing::warn!("client_config received but no template channel; skipping coinbaser fetch");
+        return;
+    };
+    let Some(template) = template_ch.current() else {
+        tracing::info!("client_config received; awaiting first template before coinbaser fetch");
+        return;
+    };
+    let Ok(prevhash_be) = hex::decode(&template.previous_block_hash) else {
+        tracing::warn!("template previous_block_hash not valid hex");
+        return;
+    };
+    if prevhash_be.len() != 32 {
+        tracing::warn!(len = prevhash_be.len(), "template prevhash not 32 bytes");
+        return;
+    }
+    // C source uses prevhash_bin (LE internal byte order). GBT returns the
+    // big-endian display hex; reverse to get internal.
+    let mut prevhash_bin = [0u8; 32];
+    for (i, b) in prevhash_be.iter().rev().enumerate() {
+        prevhash_bin[i] = *b;
+    }
+    let cmd = datum_protocol::UpstreamCommand::RequestCoinbaser {
+        coinbase_value: template.coinbase_value,
+        prevhash_bin,
+    };
+    if let Err(e) = commands_tx.send(cmd).await {
+        tracing::warn!(error = %e, "failed to enqueue coinbaser request");
+    } else {
+        tracing::info!(
+            value = template.coinbase_value,
+            "coinbaser request enqueued"
+        );
     }
 }
 
