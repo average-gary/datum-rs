@@ -22,7 +22,7 @@ use thiserror::Error;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::Mutex;
-use tokio::time::{timeout, MissedTickBehavior};
+use tokio::time::timeout;
 
 use crate::crypto::{CryptoError, DatumCrypto, DryocCrypto};
 use crate::frame::FrameHeader;
@@ -36,11 +36,6 @@ use crate::messages::{
 };
 use crate::obfuscation::{datum_header_xor_feedback, HeaderObfuscator};
 use crate::opcodes::ProtoCmd;
-
-/// Outbound heartbeat cadence. C reference enforces a 60s receive-side
-/// global timeout (datum_conf.c:192). 20s gives 3x headroom and matches the
-/// pattern of "send before peer's idle clock fires."
-const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(20);
 
 #[derive(Debug, Error)]
 pub enum ClientError {
@@ -381,52 +376,37 @@ impl Connected {
                 }
             });
 
-        let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-        heartbeat.set_missed_tick_behavior(MissedTickBehavior::Delay);
-        // First tick fires immediately; consume so we don't ping right at
-        // post-handshake when the link is fresh.
-        heartbeat.tick().await;
-
-        loop {
-            tokio::select! {
-                biased;
-                _ = heartbeat.tick() => {
-                    if let Err(e) = self
-                        .send_frame(ProtoCmd::Ping.byte_value(), &[])
-                        .await
-                    {
-                        tracing::warn!(error = %e, "heartbeat send failed; exiting send loop");
-                        break;
-                    }
+        // No outbound heartbeat — proto_cmd 0x01 is HELLO, and OCEAN drops
+        // post-handshake 0x01 frames as a malformed re-init (live bench:
+        // every connection died exactly 20s after handshake). The C reference
+        // ships no keepalive either; the recv-side global timeout
+        // (datum_conf.c:192, 60s default) is satisfied by ordinary share-
+        // response / notify traffic.
+        while let Some(cmd) = commands_rx.recv().await {
+            match cmd {
+                UpstreamCommand::SubmitShare(body) => {
+                    // Share submissions go via mining cmd (proto_cmd=5) with
+                    // is_encrypted_channel=true. The body is the encoded
+                    // ShareSubmissionPrefix; the leading 0x27 sub-opcode is
+                    // included in `body` per messages::SHARE_SUBMISSION_PREFIX_LEN.
+                    self.send_frame(5, &body).await?;
                 }
-                maybe_cmd = commands_rx.recv() => {
-                    let Some(cmd) = maybe_cmd else { break };
-                    match cmd {
-                        UpstreamCommand::SubmitShare(body) => {
-                            // Share submissions go via mining cmd (proto_cmd=5) with
-                            // is_encrypted_channel=true. The body is the encoded
-                            // ShareSubmissionPrefix; the leading 0x27 sub-opcode is
-                            // included in `body` per messages::SHARE_SUBMISSION_PREFIX_LEN.
-                            self.send_frame(5, &body).await?;
-                        }
-                        UpstreamCommand::RequestCoinbaser {
-                            coinbase_value,
-                            prevhash_bin,
-                        } => {
-                            let mut body = Vec::with_capacity(64);
-                            body.push(0x10);
-                            body.extend_from_slice(&coinbase_value.to_le_bytes());
-                            body.extend_from_slice(&prevhash_bin);
-                            body.push(0xFE);
-                            // Random pad 1-80 bytes per datum_protocol.c:346.
-                            let pad_len = 1 + (self.crypto.random_bytes(1)[0] as usize % 80);
-                            body.extend_from_slice(&self.crypto.random_bytes(pad_len));
-                            self.send_frame(5, &body).await?;
-                        }
-                        UpstreamCommand::Raw { proto_cmd, body } => {
-                            self.send_frame(proto_cmd, &body).await?;
-                        }
-                    }
+                UpstreamCommand::RequestCoinbaser {
+                    coinbase_value,
+                    prevhash_bin,
+                } => {
+                    let mut body = Vec::with_capacity(64);
+                    body.push(0x10);
+                    body.extend_from_slice(&coinbase_value.to_le_bytes());
+                    body.extend_from_slice(&prevhash_bin);
+                    body.push(0xFE);
+                    // Random pad 1-80 bytes per datum_protocol.c:346.
+                    let pad_len = 1 + (self.crypto.random_bytes(1)[0] as usize % 80);
+                    body.extend_from_slice(&self.crypto.random_bytes(pad_len));
+                    self.send_frame(5, &body).await?;
+                }
+                UpstreamCommand::Raw { proto_cmd, body } => {
+                    self.send_frame(proto_cmd, &body).await?;
                 }
             }
         }
