@@ -250,6 +250,7 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
     let (rd, mut wr) = sock.into_split();
     let mut lines = BufReader::new(rd).lines();
     let mut notify_rx = state.notify_rx.clone();
+    let mut pool_min_rx = state.pool_min_diff.clone();
 
     loop {
         tokio::select! {
@@ -564,6 +565,56 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                             },
                         );
                         send_notify(&mut wr, &job, current_diff).await?;
+                    }
+                }
+            }
+            changed = pool_min_rx.changed() => {
+                // ClientConfig from the upstream may arrive after the SV1
+                // miner has already connected and started submitting at the
+                // local config floor. Without this branch, the per-connection
+                // current_diff stays below pool_min until the next 30s vardiff
+                // tick — every share submitted in that window rejects as
+                // BAD_TARGET (13). Re-floor immediately on every pool_min bump.
+                //
+                // Sender-dropped (changed.is_err()) is non-fatal — the runtime
+                // owns the sender and never drops it during normal operation;
+                // tests construct ad-hoc receivers with the sender intentionally
+                // dropped, in which case the floor stays at vardiff.min and we
+                // skip this branch for the rest of the connection's life.
+                if changed.is_err() {
+                    std::future::pending::<()>().await;
+                    unreachable!();
+                }
+                let pool_min = *pool_min_rx.borrow_and_update();
+                let floor = state.vardiff.min.max(pool_min);
+                if floor > current_diff && subscribed {
+                    current_diff = floor;
+                    send_set_difficulty(&mut wr, current_diff).await?;
+                    tracing::info!(
+                        client_id,
+                        diff = current_diff,
+                        "pool_min raised diff floor"
+                    );
+                    // Re-emit the latest notify with the new PoT byte so the
+                    // miner switches immediately rather than at the next
+                    // template (mirrors what the vardiff arm does on diff bump).
+                    if authorized {
+                        let pending = notify_rx.borrow().clone();
+                        if let Some(job) = pending {
+                            ring_push(
+                                &mut emit_ring,
+                                EmittedJob {
+                                    job_id: job.job_id.clone(),
+                                    patched_coinb1_bin: patch_coinb1_bytes(
+                                        &job.coinb1_bin,
+                                        job.target_pot_index,
+                                        current_diff,
+                                    ),
+                                    diff: current_diff,
+                                },
+                            );
+                            send_notify(&mut wr, &job, current_diff).await?;
+                        }
                     }
                 }
             }
