@@ -1034,7 +1034,12 @@ fn build_share_submission(
         body.push(0x01);
         body.extend_from_slice(&entry.meta.prevhash_bin);
         body.extend_from_slice(&entry.meta.target_pot_index.to_le_bytes());
-        body.extend_from_slice(&entry.meta.nbits_bin);
+        // C ships sjob->nbits_bin verbatim and that buffer is the RPC hex
+        // reversed (datum_blocktemplates.c:252 `bits_bin[3-i] = hex2bin_uchar(...)`)
+        // = internal LE. Our JobMeta stores BE display order, so reverse.
+        let mut nbits_le = entry.meta.nbits_bin;
+        nbits_le.reverse();
+        body.extend_from_slice(&nbits_le);
         body.push(entry.meta.datum_coinbaser_id);
         body.extend_from_slice(&entry.meta.height.to_le_bytes());
         body.extend_from_slice(&entry.meta.coinbase_value.to_le_bytes());
@@ -1043,8 +1048,14 @@ fn build_share_submission(
         body.extend_from_slice(&entry.meta.txn_total_size.to_le_bytes());
         body.extend_from_slice(&entry.meta.txn_total_sigops.to_le_bytes());
         body.push(entry.meta.merkle_branches_bin.len() as u8);
+        // C ships merklebranches_bin in INTERNAL byte order: txid_bin is built
+        // via hex_to_bin_le (RPC hex reversed) and higher levels are raw
+        // double_sha256 outputs (already internal). Our JobMeta stores them in
+        // BE display order to match the SV1 wire frame, so reverse here.
         for branch in &entry.meta.merkle_branches_bin {
-            body.extend_from_slice(branch);
+            let mut le = *branch;
+            le.reverse();
+            body.extend_from_slice(&le);
         }
         entry.server_has_merkle_branches = true;
     }
@@ -1052,29 +1063,22 @@ fn build_share_submission(
     // 0x02 sub-block: full coinb1/coinb2 binaries. Sent once per (job,
     // coinbase_id) until server has it.
     //
-    // CRITICAL: the miner hashed coinb1 with the PoT byte patched in
-    // (server.rs::patch_coinb1_pot_byte). The pool's BAD_TARGET (reject_reason
-    // 13) check scans the coinb1 we send here for the PoT byte at
-    // target_pot_index and compares against the `target_byte` field of the
-    // 0x27 prefix. So coinb1_bin must carry the SAME patched byte the miner
-    // hashed — sourced from the SV1 server's emit-time snapshot (closes the
-    // diff_race_02_block bug; do NOT re-derive from current_diff here).
+    // C ships sjob->coinbase[id].coinb1_bin verbatim — the TEMPLATE-ORIGINAL
+    // coinb1 with the 0xFF PoT placeholder still in place at target_pot_index
+    // (datum_protocol.c:1417, datum_coinbaser.c:165/171). The server applies
+    // floorPoT(diff) at target_pot_index itself when reconstructing the
+    // miner's hash; sending a pre-patched coinb1 desyncs that.
     let cb_id = entry.meta.coinbase_id as usize;
     let already_sent_coinbase =
         cb_id < entry.server_has_coinbase.len() && entry.server_has_coinbase[cb_id];
     if !already_sent_coinbase {
-        let patched_coinb1 = share
-            .patched_coinb1_bin
-            .as_deref()
-            .ok_or("share lacks emit-time patched coinb1 snapshot")?;
-        debug_assert_eq!(patched_coinb1.len(), entry.meta.coinb1_bin.len());
         body.push(0x02);
         body.push(entry.meta.coinbase_id);
-        let cb1_len = patched_coinb1.len() as u16;
+        let cb1_len = entry.meta.coinb1_bin.len() as u16;
         let cb2_len = entry.meta.coinb2_bin.len() as u16;
         body.extend_from_slice(&cb1_len.to_le_bytes());
         body.extend_from_slice(&cb2_len.to_le_bytes());
-        body.extend_from_slice(patched_coinb1);
+        body.extend_from_slice(&entry.meta.coinb1_bin);
         body.extend_from_slice(&entry.meta.coinb2_bin);
         if cb_id < entry.server_has_coinbase.len() {
             entry.server_has_coinbase[cb_id] = true;
@@ -1585,5 +1589,133 @@ mod tests {
         };
         let enc = build_share_submission(&share, &mut entry, &user, 1).unwrap();
         assert!(enc.block_submission.is_none());
+    }
+
+    /// Byte-fidelity gate. Pins the EXACT 0x27 body bytes for a deterministic
+    /// input vector (everything up to and including the 0xFE cap). The trailing
+    /// padding is non-deterministic (xorshift static state shared across the
+    /// process) so we only check pad-shape invariants.
+    #[test]
+    fn share_submission_body_byte_fidelity() {
+        let mut entry = JobEntry {
+            meta: JobMeta {
+                datum_job_idx: 0x07,
+                coinbase_id: 0x00,
+                target_pot_index: 42,
+                version: 0x2000_0000,
+                height: 800_000,
+                coinbase_value: 5_000_000_000,
+                prevhash_bin: {
+                    let mut a = [0u8; 32];
+                    for (i, b) in a.iter_mut().enumerate() {
+                        *b = (i + 1) as u8;
+                    }
+                    a
+                },
+                nbits_bin: [0x20, 0x7f, 0xff, 0xff], // BE display
+                merkle_branches_bin: vec![{
+                    let mut a = [0u8; 32];
+                    for (i, b) in a.iter_mut().enumerate() {
+                        *b = i as u8;
+                    }
+                    a
+                }],
+                coinb1_bin: vec![0xCB, 0x11, 0x22, 0x33, 0x44, 0x55, 0xFF, 0x66, 0x77, 0x88],
+                coinb2_bin: vec![0xC2, 0x99, 0xAA],
+                datum_coinbaser_id: 0x05,
+                txn_count: 0,
+                txn_total_weight: 0,
+                txn_total_size: 0,
+                txn_total_sigops: 0,
+                block_target: [0u8; 32],
+                txn_data_hex: std::sync::Arc::new(vec![]),
+            },
+            server_has_merkle_branches: false,
+            server_has_coinbase: [false; 8],
+        };
+        let share = datum_stratum_sv1::server::SubmittedShare {
+            username: String::new(),
+            job_id: "deadbeef".into(),
+            extranonce2_hex: "a1a2a3a4a5a6a7a8".into(),
+            ntime_hex: "12345678".into(),
+            nonce_hex: "9abcdef0".into(),
+            extranonce1: [0xE1, 0xE2, 0xE3, 0xE4],
+            version_rolling: 0,
+            current_diff: 65536,
+            patched_coinb1_bin: Some(vec![
+                0xCB, 0x11, 0x22, 0x33, 0x44, 0x55, 0x10, 0x66, 0x77, 0x88,
+            ]),
+        };
+        let user = ShareUserConfig {
+            pool_address: "1POOLADDR".into(),
+            pass_full_users: false,
+            pass_workers: false,
+        };
+        let enc = build_share_submission(&share, &mut entry, &user, 65536).unwrap();
+        assert!(enc.block_submission.is_none());
+
+        // Build the canonical expected hex programmatically — every byte
+        // sourced from the C reference (datum_protocol.c:1329-1441).
+        let mut expected = String::new();
+        expected.push_str("27"); // opcode
+        expected.push_str("07"); // datum_job_idx
+        expected.push_str("00"); // coinbase_id
+        expected.push_str("00"); // flags
+        expected.push_str("10"); // target_byte
+        expected.push_str("78563412"); // ntime LE
+        expected.push_str("f0debc9a"); // nonce LE
+        expected.push_str("00000020"); // version LE
+        expected.push_str("0c"); // extranonce_size
+        expected.push_str("e1e2e3e4a1a2a3a4a5a6a7a8"); // extranonce
+        expected.push_str(&hex::encode(b"1POOLADDR"));
+        expected.push_str("00"); // username NUL
+        expected.push_str("00000000"); // 4 reserved zeros
+                                       // 0x01 sub-block
+        expected.push_str("01");
+        for i in 1u8..=32 {
+            expected.push_str(&format!("{i:02x}"));
+        }
+        expected.push_str("2a00"); // target_pot_index u16 LE
+        expected.push_str("ffff7f20"); // nbits LE (reversed from BE display)
+        expected.push_str("05"); // datum_coinbaser_id
+        expected.push_str("00350c00"); // height LE
+        expected.push_str("00f2052a01000000"); // coinbase_value LE
+        expected.push_str("00000000"); // txn_count
+        expected.push_str("00000000"); // txn_total_weight
+        expected.push_str("00000000"); // txn_total_size
+        expected.push_str("00000000"); // txn_total_sigops
+        expected.push_str("01"); // merkle_branch_count
+        for i in (0u8..=31).rev() {
+            expected.push_str(&format!("{i:02x}"));
+        }
+        // 0x02 sub-block (UNPATCHED coinb1)
+        expected.push_str("02");
+        expected.push_str("00"); // coinbase_id
+        expected.push_str("0a00"); // cb1_len LE = 10
+        expected.push_str("0300"); // cb2_len LE = 3
+        expected.push_str("cb1122334455ff667788"); // unpatched coinb1
+        expected.push_str("c299aa"); // coinb2
+                                     // Cap
+        expected.push_str("fe");
+
+        let expected_bytes = hex::decode(&expected).unwrap();
+        let cap_pos = expected_bytes.len();
+        assert!(
+            enc.body.len() > cap_pos && enc.body.len() <= cap_pos + 80,
+            "body length {} outside expected window ({}, {}+80]",
+            enc.body.len(),
+            cap_pos,
+            cap_pos
+        );
+        assert_eq!(
+            hex::encode(&enc.body[..cap_pos]),
+            expected,
+            "structured 0x27 body bytes diverge from C reference"
+        );
+        // Padding shape: all bytes equal, length 1..=80.
+        let pad = &enc.body[cap_pos..];
+        assert!((1..=80).contains(&pad.len()));
+        let p0 = pad[0];
+        assert!(pad.iter().all(|b| *b == p0));
     }
 }
