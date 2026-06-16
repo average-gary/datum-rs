@@ -428,6 +428,7 @@ async fn run_async(cfg: Config) {
         let runtime_for_upstream = runtime.clone();
         let pool_min_diff_tx_for_upstream = pool_min_diff_tx.clone();
         let pool_coinbase_tag_tx_for_upstream = pool_coinbase_tag_tx.clone();
+        let jobs_for_upstream = jobs.clone();
         if !pool_host.is_empty() && !pool_pubkey_hex.is_empty() {
             tokio::spawn(async move {
                 if let Err(e) = run_datum_upstream(
@@ -441,6 +442,7 @@ async fn run_async(cfg: Config) {
                     runtime_for_upstream,
                     pool_min_diff_tx_for_upstream,
                     pool_coinbase_tag_tx_for_upstream,
+                    jobs_for_upstream,
                 )
                 .await
                 {
@@ -554,6 +556,19 @@ impl JobTracker {
     fn get_mut(&mut self, job_id: &str) -> Option<&mut JobEntry> {
         self.by_job_id.get_mut(job_id)
     }
+
+    /// Clear every per-(job, coinbase_id) `server_has_*` send-once flag.
+    /// Called on DATUM upstream reconnect: the upstream's slot table is
+    /// state-on-the-wire, so when we lose+reestablish a connection the pool
+    /// has no record of any job we previously announced. The next share we
+    /// forward must carry the 0x01 + 0x02 sub-blocks again, otherwise OCEAN
+    /// rejects with BAD_JOB_ID (10).
+    fn reset_send_once_flags(&mut self) {
+        for entry in self.by_job_id.values_mut() {
+            entry.server_has_merkle_branches = false;
+            entry.server_has_coinbase = [false; 8];
+        }
+    }
 }
 
 async fn wait_for_shutdown() {
@@ -581,6 +596,7 @@ async fn run_datum_upstream(
     runtime: Arc<RuntimeStats>,
     pool_min_diff_tx: tokio::sync::watch::Sender<u64>,
     pool_coinbase_tag_tx: tokio::sync::watch::Sender<Option<Vec<u8>>>,
+    jobs: Arc<Mutex<JobTracker>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let pool_pubkey =
         hex::decode(pool_pubkey_hex).map_err(|e| format!("decode pool pubkey hex: {e}"))?;
@@ -609,6 +625,16 @@ async fn run_datum_upstream(
         {
             Ok(connected) => {
                 tracing::info!(motd = %connected.motd, "DATUM handshake complete");
+
+                // The pool's slot table resets when the TCP connection drops.
+                // Clear every per-(job, coinbase_id) send-once flag so the
+                // first share on each tracked job re-includes the 0x01 + 0x02
+                // sub-blocks. Without this, every post-reconnect share lands
+                // as DATUM_REJECT_BAD_JOB_ID (10).
+                {
+                    let mut g = jobs.lock().await;
+                    g.reset_send_once_flags();
+                }
 
                 let connected = std::sync::Arc::new(connected);
                 let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(64);
