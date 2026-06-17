@@ -1,26 +1,33 @@
 //! Stratum V2 server side — opt-in port (default 23335).
 //!
-//! Phase 3 status:
-//! - Extranonce 32→12-byte bridge: shipped + tested (`ExtranonceBridge`).
-//! - JobStore trait + in-memory store: shipped + tested below.
-//! - Channel registry (concurrent map keyed by channel_id): shipped + tested.
-//! - Cross-protocol golden-vector helper (asserts SV1 + SV2 paths produce
-//!   the same coinbase output sum given identical inputs): shipped + tested.
-//! - SRI `channels_sv2`/`handlers_sv2` integration: **wiring in progress**.
-//!   SRI's library MSRV is 1.75 and its apps MSRV is 1.85; datum-rs runs on
-//!   1.89 — Rust is forward-compatible, so the MSRV gap is not a blocker.
-//!   The actual prerequisites are (a) pin a specific `stratum-core` git rev
-//!   in the workspace `Cargo.toml`, and (b) align our type names with the
-//!   current SRI shape. The integration plan: keep `InMemoryJobStore` for
-//!   tests but route the live channel state through SRI's `JobStore` trait
-//!   (default impl in `stratum_core::channels_sv2::server::jobs::job_store`)
-//!   and replace our `Channel` registry with
-//!   `stratum_core::channels_sv2::server::extended::ExtendedChannel::new_for_pool`.
-//!   Per-channel job assembly uses SRI's `JobFactory`
-//!   (`channels_sv2::server::jobs::factory`); the client-side dispatch
-//!   trait is `stratum_core::handlers_sv2::HandleMiningMessagesFromClientAsync`.
-//!   The structural surface here matches the SRI shape so the swap is
-//!   localized to two places.
+//! Phase status:
+//! - **Phase 1**: Shared `TemplateState` watch channel — landed (in
+//!   `datum-blocktemplates`).
+//! - **Phase 2**: SRI integration scaffolding — landed.
+//! - **Phase 3**: Noise listener + `SetupConnection` — landed
+//!   (`Listener`, `handle_setup_connection`, `AuthorityKey`).
+//! - **Phase 4**: Channel open + immediate first job emission — landed
+//!   (`ChannelManager`, `MiningOut`, `OpenedChannel`).
+//! - **Phase 5+**: Share path + vardiff + block-found — pending.
+//!
+//! ## Module map
+//!
+//! - [`auth`] — authority keypair on-disk format + base58check pubkey emit.
+//! - [`listener`] — bind/accept loop; per-connection Noise + SetupConnection.
+//! - [`noise_stream`] — Noise NX handshake + transport-mode framing.
+//! - [`setup_connection`] — `SetupConnection` validate + reply enum.
+//! - [`channel_manager`] — Phase 4: `OpenStandardMiningChannel` /
+//!   `OpenExtendedMiningChannel` handlers + immediate `(NewMiningJob |
+//!   NewExtendedMiningJob, SetNewPrevHash)` emission.
+//!
+//! ## Wire byte-order rule
+//!
+//! All `U256` fields on the SV2 wire are LE — no exceptions. Per the
+//! [SV2 mining-protocol concept][mining]'s "Wire byte-order rule" §5.3.1.
+//! The six sites that **must** be LE are tested with byte-for-byte goldens
+//! in `channel_manager::tests`.
+//!
+//! [mining]: ../../../.wiki/wiki/concepts/sv2-mining-protocol.md
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -31,13 +38,32 @@ use tokio::sync::Mutex;
 use datum_coinbaser::{CoinbaseOutput, CoinbaserBlob};
 
 pub mod auth;
+pub mod channel_manager;
 pub mod listener;
 pub mod noise_stream;
 pub mod setup_connection;
 
 pub use auth::{encode_authority_pubkey_b58, AuthorityKey, AuthorityKeyError};
+pub use channel_manager::{
+    ChannelManager, ChannelOpenError, MiningOut, OpenedChannel, MAX_CHANNELS,
+    TOTAL_EXTRANONCE_LEN,
+};
 pub use listener::{Listener, ListenerConfig, ListenerError};
 pub use setup_connection::{handle_setup_connection, SetupConnectionResponse};
+
+/// Mirrors SRI's `handlers_sv2::mining::SupportedChannelTypes`. Re-exported
+/// here so callers don't need to depend on `stratum_core` to read the
+/// channel-type matrix the [SRI port plan][port-plan] describes.
+///
+/// [port-plan]: ../../../.wiki/wiki/references/sri-pool-mining-handler.md
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SupportedChannelTypes {
+    Standard,
+    Extended,
+    StandardAndExtended,
+    Group,
+    GroupAndExtended,
+}
 
 /// 32-byte SV2 hierarchical extranonce → 12-byte flat (DATUM upstream
 /// expects a single 12-byte field). Per [sv2-downstream-architecture] §

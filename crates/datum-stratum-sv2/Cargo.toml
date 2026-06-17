@@ -16,6 +16,10 @@ stratum-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# Server-side merkle-root precompute for Standard channels (Phase 4).
+# Pinned 0.10 to match the rest of the workspace; sha2 0.11 in the lockfile
+# is pulled by SRI's bitcoin path and we keep our edge separate.
+sha2 = "0.10"
 # SRI's Noise/key types come transitively via stratum-core, but we depend on
 # secp256k1 directly so we can build the Schnorr Keypair/SecretKey we hand to
 # `noise_sv2::Responder::from_authority_kp`. Pin the version SRI uses on this

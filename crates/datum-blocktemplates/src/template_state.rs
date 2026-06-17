@@ -254,6 +254,13 @@ impl TemplateStateChannel {
             }
         }
     }
+
+    /// Consume the channel and yield the inner `watch::Receiver`. SV2's
+    /// `ChannelManager` needs an owned receiver because it calls `.borrow()`
+    /// directly (no async wrap on the immediate channel-open path).
+    pub fn into_receiver(self) -> watch::Receiver<Option<Arc<TemplateState>>> {
+        self.rx
+    }
 }
 
 /// Publisher half of the template-state watch channel. The runtime holds one

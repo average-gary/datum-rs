@@ -134,24 +134,51 @@ impl Listener {
     /// task that runs Noise + SetupConnection; the loop itself never blocks
     /// on a slow client.
     pub async fn run(self) {
+        // Headless mode (no shutdown signal) — used by Phase 1-3 callers that
+        // run-forever. New callers should prefer [`Listener::run_with_shutdown`].
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        self.run_with_shutdown(rx).await;
+    }
+
+    /// Run the accept loop until `shutdown_rx` flips to `true`.
+    ///
+    /// Per Phase 3's gap notes ("the listener has no graceful-shutdown
+    /// channel today — Phase 4 should add a `tokio::sync::watch::Sender<bool>`
+    /// like SV1's `sv1_shutdown_tx`"). The shutdown signal lets `datum-bin`
+    /// drain in-flight Noise handshakes on Ctrl-C; the per-connection tasks
+    /// remain to wind themselves down at their own pace, but the accept
+    /// loop returns immediately.
+    pub async fn run_with_shutdown(self, mut shutdown_rx: tokio::sync::watch::Receiver<bool>) {
         loop {
-            match self.inner.accept().await {
-                Ok((stream, peer)) => {
-                    debug!(%peer, "sv2: connection accepted");
-                    let cfg = self.cfg.clone();
-                    tokio::spawn(async move {
-                        if let Err(e) = handle_connection(stream, cfg).await {
-                            warn!(%peer, error = %e, "sv2: connection ended with error");
-                        } else {
-                            debug!(%peer, "sv2: connection closed");
-                        }
-                    });
+            tokio::select! {
+                biased;
+                changed = shutdown_rx.changed() => {
+                    // `changed()` returns Err if the sender is dropped — treat
+                    // that as a shutdown too (no point staying bound).
+                    let stop = changed.is_err() || *shutdown_rx.borrow();
+                    if stop {
+                        info!(sv2_addr = %self.cfg.bind_addr, "sv2 stratum listener shutting down");
+                        return;
+                    }
                 }
-                Err(e) => {
-                    error!(error = %e, "sv2: accept failed");
-                    // Brief backoff to avoid spinning on a permanently-broken
-                    // listener (e.g. fd exhaustion).
-                    tokio::time::sleep(Duration::from_millis(100)).await;
+                accept = self.inner.accept() => match accept {
+                    Ok((stream, peer)) => {
+                        debug!(%peer, "sv2: connection accepted");
+                        let cfg = self.cfg.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_connection(stream, cfg).await {
+                                warn!(%peer, error = %e, "sv2: connection ended with error");
+                            } else {
+                                debug!(%peer, "sv2: connection closed");
+                            }
+                        });
+                    }
+                    Err(e) => {
+                        error!(error = %e, "sv2: accept failed");
+                        // Brief backoff to avoid spinning on a permanently-broken
+                        // listener (e.g. fd exhaustion).
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
                 }
             }
         }

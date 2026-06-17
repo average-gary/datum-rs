@@ -711,6 +711,7 @@ dependencies = [
  "datum-stratum-sv1",
  "hex",
  "secp256k1 0.28.2",
+ "sha2 0.10.9",
  "stratum-core",
  "thiserror",
  "tokio",
