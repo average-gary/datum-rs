@@ -163,8 +163,7 @@ fn sv1_coinb_and_sv2_coinbase_tx_prefix_suffix_pay_identical_satoshis() {
     // Build a TemplateState (Phase 1 plumbing) — this is where Phase 4's SV2
     // path reads its `coinbase_tx_prefix` (= coinb1) / `coinbase_tx_suffix`
     // (= coinb2) from. Both protocols share this single source of truth.
-    let template_state =
-        TemplateState::from_template_and_blob(&template(), &blob, scriptsig, 1);
+    let template_state = TemplateState::from_template_and_blob(&template(), &blob, scriptsig, 1);
 
     // SV1 path: assemble_notify embeds outputs in coinb2.
     let notify = assemble_notify("job-1", &template(), &blob, b"datum-rs", true);
@@ -187,11 +186,7 @@ fn sv1_coinb_and_sv2_coinbase_tx_prefix_suffix_pay_identical_satoshis() {
     idx += 1;
     let mut sv2_suffix_sum: u64 = 0;
     for _ in 0..output_count {
-        let value = u64::from_le_bytes(
-            sv2_coinbase_tx_suffix[idx..idx + 8]
-                .try_into()
-                .unwrap(),
-        );
+        let value = u64::from_le_bytes(sv2_coinbase_tx_suffix[idx..idx + 8].try_into().unwrap());
         idx += 8;
         let scriptlen = sv2_coinbase_tx_suffix[idx] as usize;
         idx += 1 + scriptlen;

@@ -75,9 +75,7 @@ pub struct ListenerConfig {
 }
 
 impl ListenerConfig {
-    pub fn from_datum_config(
-        cfg: &datum_config::StratumV2Config,
-    ) -> Result<Self, ListenerError> {
+    pub fn from_datum_config(cfg: &datum_config::StratumV2Config) -> Result<Self, ListenerError> {
         let listen_addr = if cfg.listen_addr.is_empty() {
             datum_config::DEFAULT_STRATUM_V2_LISTEN_ADDR.to_string()
         } else {
@@ -92,8 +90,7 @@ impl ListenerConfig {
                     "stratum_v2.listen_addr/listen_port",
                 ),
             })?;
-        let authority =
-            AuthorityKey::load(&cfg.authority_pubkey_path, &cfg.authority_secret_path)?;
+        let authority = AuthorityKey::load(&cfg.authority_pubkey_path, &cfg.authority_secret_path)?;
         Ok(Self {
             bind_addr,
             cert_validity: Duration::from_secs(cfg.cert_validity_sec as u64),
@@ -211,14 +208,11 @@ async fn handle_connection(
         &cfg.authority.secret_bytes,
         cfg.cert_validity,
     )
-    .map_err(|_| {
-        ConnectionError::Noise(NoiseStreamError::HandshakeRemoteInvalidMessage)
-    })?;
+    .map_err(|_| ConnectionError::Noise(NoiseStreamError::HandshakeRemoteInvalidMessage))?;
     let role = HandshakeRole::Responder(responder);
 
     let stream =
-        NoiseTcpStream::<AnyMessage<'static>>::accept(stream, role, cfg.handshake_timeout)
-            .await?;
+        NoiseTcpStream::<AnyMessage<'static>>::accept(stream, role, cfg.handshake_timeout).await?;
     let (mut reader, mut writer) = stream.into_split();
 
     // First post-handshake frame must be SetupConnection (msg_type 0x00, ext
@@ -227,7 +221,9 @@ async fn handle_connection(
     let mut sv2_frame: StandardSv2Frame<AnyMessage<'static>> = frame
         .try_into()
         .map_err(|_| ConnectionError::UnexpectedFirstFrame { got: 0xff })?;
-    let header = sv2_frame.get_header().expect("Sv2Frame always has a header");
+    let header = sv2_frame
+        .get_header()
+        .expect("Sv2Frame always has a header");
     let msg_type = header.msg_type();
     if msg_type != MESSAGE_TYPE_SETUP_CONNECTION {
         return Err(ConnectionError::UnexpectedFirstFrame { got: msg_type });
@@ -236,12 +232,16 @@ async fn handle_connection(
     // &mut [u8])>. SRI's Sv2Frame keeps the payload bytes alongside the
     // header; we extract them and feed AnyMessage's parser.
     let payload = sv2_frame.payload();
-    let parsed: AnyMessage<'_> =
-        (header, payload).try_into().map_err(ConnectionError::Parse)?;
+    let parsed: AnyMessage<'_> = (header, payload)
+        .try_into()
+        .map_err(ConnectionError::Parse)?;
     let setup_msg = match parsed {
         AnyMessage::Common(CommonMessages::SetupConnection(s)) => s,
         other => {
-            warn!(?other, "sv2: first frame parsed but was not SetupConnection");
+            warn!(
+                ?other,
+                "sv2: first frame parsed but was not SetupConnection"
+            );
             return Err(ConnectionError::UnexpectedFirstFrame { got: msg_type });
         }
     };
@@ -276,7 +276,9 @@ async fn handle_connection(
     loop {
         match reader.read_frame().await {
             Ok(_frame) => {
-                debug!("sv2: post-Setup frame received but channel handling not yet wired (Phase 4)");
+                debug!(
+                    "sv2: post-Setup frame received but channel handling not yet wired (Phase 4)"
+                );
             }
             Err(NoiseStreamError::SocketClosed) => return Ok(()),
             Err(e) => return Err(ConnectionError::Noise(e)),

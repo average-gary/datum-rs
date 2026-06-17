@@ -18,12 +18,11 @@ use datum_stratum_sv2::auth::{encode_authority_pubkey_b58, AuthorityKey};
 use datum_stratum_sv2::listener::{Listener, ListenerConfig};
 use datum_stratum_sv2::noise_stream::NOISE_HANDSHAKE_TIMEOUT;
 use stratum_core::codec_sv2::{
-    HandshakeRole, NoiseEncoder, StandardEitherFrame, StandardNoiseDecoder, StandardSv2Frame,
-    State,
+    HandshakeRole, NoiseEncoder, StandardEitherFrame, StandardNoiseDecoder, StandardSv2Frame, State,
 };
 use stratum_core::common_messages_sv2::{
-    Protocol, SetupConnection, MESSAGE_TYPE_SETUP_CONNECTION,
-    MESSAGE_TYPE_SETUP_CONNECTION_ERROR, MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
+    Protocol, SetupConnection, MESSAGE_TYPE_SETUP_CONNECTION, MESSAGE_TYPE_SETUP_CONNECTION_ERROR,
+    MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS,
 };
 use stratum_core::framing_sv2::framing::{HandShakeFrame, Sv2Frame};
 use stratum_core::noise_sv2::Initiator;
@@ -200,8 +199,7 @@ async fn run_initiator_and_send_setup(
             Err(e) => panic!("decode act-2: {e:?}"),
         }
     };
-    let handshake_frame: HandShakeFrame =
-        frame.try_into().expect("act-2 is a handshake frame");
+    let handshake_frame: HandShakeFrame = frame.try_into().expect("act-2 is a handshake frame");
     let payload: [u8; stratum_core::noise_sv2::INITIATOR_EXPECTED_HANDSHAKE_MESSAGE_SIZE] =
         handshake_frame
             .get_payload_when_handshaking()
@@ -259,11 +257,7 @@ fn mk_setup(flags: u32) -> SetupConnection<'static> {
         min_version: 2,
         max_version: 2,
         flags,
-        endpoint_host: "datum-rs-test"
-            .to_string()
-            .into_bytes()
-            .try_into()
-            .unwrap(),
+        endpoint_host: "datum-rs-test".to_string().into_bytes().try_into().unwrap(),
         endpoint_port: 23335,
         vendor: "test".to_string().into_bytes().try_into().unwrap(),
         hardware_version: "v1".to_string().into_bytes().try_into().unwrap(),
@@ -322,4 +316,3 @@ async fn listener_bind_smoke_uses_real_listener_struct() {
     // the loopback handshake tests above exercise the run loop.
     drop(listener);
 }
-

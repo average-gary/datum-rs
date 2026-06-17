@@ -42,11 +42,10 @@ pub enum AuthorityKeyError {
         source: std::io::Error,
     },
     #[error("base58check decode {path}: {kind}")]
-    Bs58 {
-        path: PathBuf,
-        kind: &'static str,
-    },
-    #[error("authority pubkey at {path} has wrong base58check version (got {got:#06x}, want 0x0001)")]
+    Bs58 { path: PathBuf, kind: &'static str },
+    #[error(
+        "authority pubkey at {path} has wrong base58check version (got {got:#06x}, want 0x0001)"
+    )]
     WrongVersion { path: PathBuf, got: u16 },
     #[error("authority pubkey at {path} has wrong length (got {got} bytes, want 34 = 2 version + 32 key)")]
     WrongPubkeyLen { path: PathBuf, got: usize },
@@ -143,12 +142,11 @@ impl AuthorityKey {
         // and compare against the operator-supplied pubkey. This catches the
         // class of misconfig where the operator copy-pasted a stale pubkey.
         let secp = Secp256k1::new();
-        let secret = SecretKey::from_slice(&secret_bytes).map_err(|e| {
-            AuthorityKeyError::InvalidSecret {
+        let secret =
+            SecretKey::from_slice(&secret_bytes).map_err(|e| AuthorityKeyError::InvalidSecret {
                 path: secret_path.to_path_buf(),
                 source: e,
-            }
-        })?;
+            })?;
         let derived = Keypair::from_secret_key(&secp, &secret)
             .x_only_public_key()
             .0

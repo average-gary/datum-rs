@@ -531,10 +531,9 @@ mod tests {
         let mut c = min_valid_config();
         c.stratum_v2.cert_validity_sec = STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP + 1;
         let errs = c.validate().unwrap_err();
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            ValidationError::StratumV2CertValiditySecTooLarge { .. }
-        )));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::StratumV2CertValiditySecTooLarge { .. })));
     }
 
     #[test]
@@ -557,14 +556,12 @@ mod tests {
         c.stratum_v2.enabled = true;
         // both paths default to empty PathBuf
         let errs = c.validate().unwrap_err();
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            ValidationError::StratumV2EnabledWithoutAuthorityPubkey
-        )));
-        assert!(errs.iter().any(|e| matches!(
-            e,
-            ValidationError::StratumV2EnabledWithoutAuthoritySecret
-        )));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::StratumV2EnabledWithoutAuthorityPubkey)));
+        assert!(errs
+            .iter()
+            .any(|e| matches!(e, ValidationError::StratumV2EnabledWithoutAuthoritySecret)));
     }
 
     #[test]

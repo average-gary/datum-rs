@@ -8,7 +8,16 @@
 //!   (`Listener`, `handle_setup_connection`, `AuthorityKey`).
 //! - **Phase 4**: Channel open + immediate first job emission — landed
 //!   (`ChannelManager`, `MiningOut`, `OpenedChannel`).
-//! - **Phase 5+**: Share path + vardiff + block-found — pending.
+//! - **Phase 5**: Share path + vardiff + block-found — landed
+//!   (`validate_extended_share`, `validate_standard_share`,
+//!   `handle_update_channel`, `VardiffState`, `ShareOutcome`).
+//! - **Phase 6**: Wire end-to-end + golden vectors + loopback — landed
+//!   (`MiningOut::SubmitSharesSuccess` / `SubmitSharesError` / `SetTarget` /
+//!   `UpdateChannelError` variants, `clamp_target_to_channel_max` for the
+//!   spec-required `current_target ≤ max_target` invariant, golden vectors
+//!   in `tests/sv2_wire_goldens.rs`, in-process loopback driver in
+//!   `tests/sv2_loopback.rs`, `/metrics` rows for sv2 channels + share
+//!   counters + authority-pubkey publication in `datum-bin`).
 //!
 //! ## Module map
 //!
@@ -46,8 +55,8 @@ pub mod share_path;
 
 pub use auth::{encode_authority_pubkey_b58, AuthorityKey, AuthorityKeyError};
 pub use channel_manager::{
-    ChannelManager, ChannelOpenError, MiningOut, OpenedChannel, MAX_CHANNELS,
-    TOTAL_EXTRANONCE_LEN,
+    clamp_target_to_channel_max, ChannelManager, ChannelOpenError, MiningOut, OpenedChannel,
+    MAX_CHANNELS, TOTAL_EXTRANONCE_LEN,
 };
 pub use listener::{Listener, ListenerConfig, ListenerError};
 pub use setup_connection::{handle_setup_connection, SetupConnectionResponse};
@@ -280,6 +289,11 @@ pub struct ChannelState {
 pub struct ChannelRegistry {
     inner: Mutex<HashMap<u32, ChannelState>>,
     next_id: std::sync::atomic::AtomicU32,
+    /// Synchronously-readable channel count for the `/metrics` endpoint
+    /// (Phase 6). Updated atomically on `open` / `close` so the metrics task
+    /// can read without acquiring the inner Mutex (avoiding await in the
+    /// synchronous `MetricsSource::snapshot` path).
+    count: std::sync::atomic::AtomicUsize,
 }
 
 impl ChannelRegistry {
@@ -300,15 +314,30 @@ impl ChannelRegistry {
                 job_store: InMemoryJobStore::new_eight_job_ring(),
             },
         );
+        self.count
+            .store(g.len(), std::sync::atomic::Ordering::Relaxed);
         channel_id
     }
 
     pub async fn close(&self, channel_id: u32) {
-        self.inner.lock().await.remove(&channel_id);
+        let mut g = self.inner.lock().await;
+        g.remove(&channel_id);
+        self.count
+            .store(g.len(), std::sync::atomic::Ordering::Relaxed);
     }
 
     pub async fn count(&self) -> usize {
         self.inner.lock().await.len()
+    }
+
+    /// Synchronous count — readable from non-async context (e.g. the
+    /// `/metrics` JSON snapshot). Maintained by `open` / `close` so it's
+    /// always within a tick of the locked count; "tick" here means "between
+    /// the `open` lock release and the `count.store` line", which the same
+    /// task does in succession — so external readers see at most one stale
+    /// value during a concurrent open/close burst.
+    pub fn active_count(&self) -> usize {
+        self.count.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub async fn put_job(&self, channel_id: u32, job: ExtendedJob) -> bool {
@@ -392,8 +421,11 @@ mod store_tests {
         let id2 = r.open("worker-2".into()).await;
         assert_ne!(id1, id2);
         assert_eq!(r.count().await, 2);
+        // Phase 6 sync snapshot tracks the same value.
+        assert_eq!(r.active_count(), 2);
         r.close(id1).await;
         assert_eq!(r.count().await, 1);
+        assert_eq!(r.active_count(), 1);
     }
 
     #[tokio::test]

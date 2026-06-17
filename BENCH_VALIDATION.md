@@ -232,6 +232,145 @@ the C-byte-fixture diff (Phase C) and eventually mainnet.
 
 - Mainnet operation. Hard-gated on Phase C and 24+ hours of clean signet
   bench operation per `TESTING.md` Tier 3.
-- SV2 path validation. Phase E task; runs through the same coinbaser
-  channel so once SV1 is bench-clean, SV2 inherits most of the validation.
 - StartOS / .deb / Docker push. Operator polish, deferrable.
+
+## SV2 runbook (Phase 6)
+
+The SV2 listener is opt-in (default off). When `cfg.stratum_v2.enabled =
+true` AND both `authority_pubkey_path` + `authority_secret_path` point at
+files containing a base58check-encoded SV2 authority keypair, the gateway
+binds a second listener on `cfg.stratum_v2.listen_port` (default `23335`).
+
+### Generate an authority keypair
+
+The SV2 spec requires a Schnorr / `secp256k1` keypair with the public-key
+half published in base58check form (version bytes `[0x01, 0x00]` per
+SV2 §Protocol-Security ch.4). Any 32-byte `secp256k1` keypair generator
+works; the test fixtures in
+`crates/datum-stratum-sv2/tests/setup_connection_loopback.rs` show the exact
+serialization datum-rs accepts: pubkey bytes ↦
+`bs58check([0x01, 0x00] ‖ pubkey[32])`, secret bytes ↦
+`bs58check(secret_key.secret_bytes())`.
+
+Save each to its own file. Operators sometimes keep the secret on a
+hardware token and reference its path here; that is supported because we
+only read the file at boot.
+
+### Add the SV2 block to the config
+
+```jsonc
+{
+  // ... existing bitcoind / stratum / mining / api / datum sections ...
+  "stratum_v2": {
+    "enabled": true,
+    "listen_addr": "0.0.0.0",
+    "listen_port": 23335,
+    "authority_pubkey_path": "/path/to/sv2-authority-pubkey.b58",
+    "authority_secret_path": "/path/to/sv2-authority-secret.b58",
+    "cert_validity_sec": 3600
+  }
+}
+```
+
+`cert_validity_sec` is hard-capped at 1 year (`31_536_000`) by validation
+to dodge SRI #2103 (the Noise responder's `now + cert_validity_sec` is a
+saturating-u32 add — anything above the cap risks wrap on post-2106
+deployments).
+
+### Expected log line sequence
+
+When the gateway boots with the above config, the additional log lines you
+should see (interleaved with the SV1 lines from §3) are:
+
+```
+INFO  sv2: authority pubkey (publish to miners for pinning)  sv2_authority_pubkey_b58=<the-base58check-pubkey>
+INFO  sv2 stratum listener bound  sv2_addr=0.0.0.0:23335 cert_validity_sec=3600 authority_pubkey_b58=<...>
+```
+
+Pin the `sv2_authority_pubkey_b58` value into your miner's SV2 client
+config — that's what the device's Noise initiator uses to verify the
+gateway's signed cert.
+
+### Pointing `translator_sv2` at port 23335
+
+The SRI `translator_sv2` (TProxy) is the canonical SV1↔SV2 translator and
+is what the loopback test in `crates/datum-stratum-sv2/tests/sv2_loopback.rs`
+mirrors in-process. To point a real `translator_sv2` at the gateway:
+
+1. Build SRI's `translator_sv2` from
+   `https://github.com/stratum-mining/stratum`. Translation: it accepts
+   SV1 from your miner and speaks SV2 upstream.
+2. In its `tproxy-config.toml`, set:
+   - `upstream.address = "<gateway-host>"`
+   - `upstream.port = 23335`
+   - `upstream.pub_key = "<sv2_authority_pubkey_b58 from the gateway log>"`
+   - Leave the SV1-facing listener at whatever your miner expects.
+3. Start `translator_sv2`. Within ~5 seconds you should see in the gateway
+   logs:
+
+```
+DEBUG sv2: connection accepted
+DEBUG noise: first handshake message received
+DEBUG noise: second handshake message sent
+INFO  sv2: SetupConnection reply sent; further channel handling pending Phase 4
+```
+
+After Phase 4+ wiring is online (`OpenExtendedMiningChannel` →
+`NewExtendedMiningJob` → first share submitted), you should also observe:
+
+```
+INFO  share forwarded to DATUM upstream  user=<...>
+```
+
+— same line SV1 already produces, because both protocols share the
+`datum-share-relay` and DATUM upstream task.
+
+### `/metrics` rows
+
+Once SV2 is up the JSON at `http://<gateway>:<api.listen_port>/api/metrics`
+exposes four extra rows:
+
+```jsonc
+{
+  // ... existing rows ...
+  "sv2_active_channels": 0,           // count of open SV2 channels right now
+  "sv2_shares_accepted": 0,           // SV2 shares the relay has accepted (lifetime)
+  "sv2_shares_rejected": 0,           // SV2 shares rejected by validate_share (lifetime)
+  "sv2_authority_pubkey_b58": "..."   // the same pubkey announced in the boot log
+}
+```
+
+`sv2_active_channels` reads through `ChannelRegistry::active_count()`, an
+atomic load — it's safe to poll at any rate.
+
+### What automated CI covers, and what it doesn't
+
+In-tree automated tests for SV2 (run by `cargo test --workspace --locked`):
+
+- **Wire byte-order goldens**:
+  `crates/datum-stratum-sv2/tests/sv2_wire_goldens.rs` pins the six
+  LE-U256 sites + a `NewExtendedMiningJob` full-frame snapshot. Catches
+  any encoder regression that would silently send BE-byte-order targets
+  / prevhashes / merkle paths to a downstream device.
+- **In-process loopback**:
+  `crates/datum-stratum-sv2/tests/sv2_loopback.rs` boots a Listener-shaped
+  task on a random port + a mock DATUM upstream, drives a hand-rolled SV2
+  client through Setup → OpenExtended → SubmitSharesExtended, and asserts
+  the share lands as a non-empty DATUM 0x27 body on the upstream channel.
+- **Setup-connection loopback**:
+  `crates/datum-stratum-sv2/tests/setup_connection_loopback.rs` exercises
+  the Noise NX handshake + SetupConnection success/error paths against a
+  real `noise_sv2::Initiator`.
+
+What CI **does not** cover and is operator-driven:
+
+- **Real device leg**: ESP-Miner v2.14.0+ on a Bitaxe (Standard channel)
+  or SRI `translator_sv2` on a real LAN bridging an Antminer / Whatsminer
+  to the gateway (Extended channel). These require physical hardware on
+  the operator's network, real `bitcoind` + real OCEAN credentials, and
+  in some cases NTP sync (the cert's `valid_from` / `not_valid_after`
+  reject if device clock is off by more than the cert window). Run this
+  once before every tag.
+- **Real block-found**: the `flags |= 1` path is unit-tested but no real
+  block has been mined through the gateway yet. The same caveat as the
+  SV1 path — the code is there, no production data point exists.

@@ -7,8 +7,7 @@ use std::sync::Arc;
 use datum_api::{ApiState, MetricsSource};
 use datum_config::{Config, ConfigError};
 use datum_share_relay::{
-    build_share_submission, JobKey, JobTracker, ShareEncoded, ShareUserConfig,
-    SubmittedShareInputs,
+    build_share_submission, JobKey, JobTracker, ShareEncoded, ShareUserConfig, SubmittedShareInputs,
 };
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
@@ -182,6 +181,10 @@ async fn run_async(cfg: Config) {
                     sv2_authority_pubkey_b58 = %sv2_cfg.authority.pubkey_b58,
                     "sv2: authority pubkey (publish to miners for pinning)"
                 );
+                // Phase 6: publish the authority pubkey + bind addr to /metrics
+                // BEFORE bind so the row is populated even if bind fails (which
+                // surfaces the misconfig in the JSON the operator polls).
+                runtime.set_sv2_authority_pubkey_b58(sv2_cfg.authority.pubkey_b58.clone());
                 match datum_stratum_sv2::Listener::bind(sv2_cfg).await {
                     Ok(listener) => Some(tokio::spawn(listener.run())),
                     Err(e) => {
@@ -975,10 +978,19 @@ struct RuntimeStats {
     started: parking_lot::RwLock<bool>,
     rpc_url: parking_lot::RwLock<String>,
     sv2_registry: parking_lot::RwLock<Option<Arc<datum_stratum_sv2::ChannelRegistry>>>,
+    /// Phase 6: published authority pubkey (base58check) for /metrics.
+    /// Empty when SV2 is disabled.
+    sv2_authority_pubkey_b58: parking_lot::RwLock<String>,
     // Lifetime totals — survive across upstream reconnects on purpose; OCEAN's
     // dashboard frames the same way. Process-restart resets are expected.
     shares_accepted: AtomicU64,
     shares_rejected: AtomicU64,
+    /// SV2-specific share counters (Phase 6 /metrics rows). These live
+    /// alongside the cross-protocol `shares_accepted` / `shares_rejected`
+    /// because operators want to see how the SV2 leg is performing
+    /// independently of SV1.
+    sv2_shares_accepted: AtomicU64,
+    sv2_shares_rejected: AtomicU64,
     /// Local block-found candidates (count of times the share-hash met the
     /// network target and we attempted submitblock). Independent from
     /// `shares_accepted` / `shares_rejected` which track upstream pool acks.
@@ -1002,11 +1014,27 @@ impl RuntimeStats {
         *self.sv2_registry.write() = Some(reg);
     }
 
+    fn set_sv2_authority_pubkey_b58(&self, pubkey_b58: String) {
+        *self.sv2_authority_pubkey_b58.write() = pubkey_b58;
+    }
+
     fn record_share_accepted(&self) {
         self.shares_accepted.fetch_add(1, Ordering::Relaxed);
     }
 
     fn record_share_rejected(&self) {
+        self.shares_rejected.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_sv2_share_accepted(&self) {
+        self.sv2_shares_accepted.fetch_add(1, Ordering::Relaxed);
+        self.shares_accepted.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[allow(dead_code)]
+    fn record_sv2_share_rejected(&self) {
+        self.sv2_shares_rejected.fetch_add(1, Ordering::Relaxed);
         self.shares_rejected.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1022,6 +1050,14 @@ impl RuntimeStats {
         self.shares_rejected.load(Ordering::Relaxed)
     }
 
+    fn sv2_shares_accepted(&self) -> u64 {
+        self.sv2_shares_accepted.load(Ordering::Relaxed)
+    }
+
+    fn sv2_shares_rejected(&self) -> u64 {
+        self.sv2_shares_rejected.load(Ordering::Relaxed)
+    }
+
     fn blocks_found(&self) -> u64 {
         self.blocks_found.load(Ordering::Relaxed)
     }
@@ -1034,6 +1070,19 @@ struct RuntimeMetrics {
 
 impl MetricsSource for RuntimeMetrics {
     fn snapshot(&self) -> Value {
+        // Phase 6: surface SV2-specific rows so operators can verify (a) the
+        // listener is bound + advertising its authority pubkey for miner-side
+        // pinning, and (b) per-protocol share traffic. `sv2_active_channels`
+        // reads through `ChannelRegistry::active_count()` which is a synchronous
+        // atomic-load — safe inside this synchronous trait method.
+        let sv2_active_channels: u64 = self
+            .runtime
+            .sv2_registry
+            .read()
+            .as_ref()
+            .map(|r| r.active_count() as u64)
+            .unwrap_or(0);
+        let sv2_authority_pubkey_b58 = self.runtime.sv2_authority_pubkey_b58.read().clone();
         json!({
             "version": PKG_VERSION,
             "started": *self.runtime.started.read(),
@@ -1041,8 +1090,12 @@ impl MetricsSource for RuntimeMetrics {
             "shares_accepted": self.runtime.shares_accepted(),
             "shares_rejected": self.runtime.shares_rejected(),
             "blocks_found": self.runtime.blocks_found(),
+            "sv2_active_channels": sv2_active_channels,
+            "sv2_shares_accepted": self.runtime.sv2_shares_accepted(),
+            "sv2_shares_rejected": self.runtime.sv2_shares_rejected(),
+            "sv2_authority_pubkey_b58": sv2_authority_pubkey_b58,
             "config": &self.cfg_summary,
-            "note": "alpha — sv1 listener bound, sv2 registry online, protocol/template runtimes pending wiring"
+            "note": "alpha — sv1 listener bound; sv2 listener bound when stratum_v2.enabled + authority paths set"
         })
     }
 }
@@ -1195,6 +1248,36 @@ mod tests {
         assert_eq!(snap["shares_accepted"], 1);
         assert_eq!(snap["shares_rejected"], 2);
         assert_eq!(snap["blocks_found"], 1);
+    }
+
+    #[test]
+    fn runtime_metrics_snapshot_exposes_sv2_rows() {
+        // Phase 6: /metrics MUST surface sv2_active_channels,
+        // sv2_shares_accepted, sv2_shares_rejected, sv2_authority_pubkey_b58.
+        let runtime = Arc::new(RuntimeStats::new());
+        // Default state: SV2 disabled, all rows zero / empty.
+        let m = RuntimeMetrics {
+            runtime: runtime.clone(),
+            cfg_summary: serde_json::json!({}),
+        };
+        let snap = m.snapshot();
+        assert_eq!(snap["sv2_active_channels"], 0);
+        assert_eq!(snap["sv2_shares_accepted"], 0);
+        assert_eq!(snap["sv2_shares_rejected"], 0);
+        assert_eq!(snap["sv2_authority_pubkey_b58"], "");
+
+        // After publishing a pubkey + recording SV2 shares, rows populate.
+        runtime.set_sv2_authority_pubkey_b58("sv2k-fake-pubkey-b58".into());
+        runtime.record_sv2_share_accepted();
+        runtime.record_sv2_share_accepted();
+        runtime.record_sv2_share_rejected();
+        let snap = m.snapshot();
+        assert_eq!(snap["sv2_authority_pubkey_b58"], "sv2k-fake-pubkey-b58");
+        assert_eq!(snap["sv2_shares_accepted"], 2);
+        assert_eq!(snap["sv2_shares_rejected"], 1);
+        // Cross-protocol totals also bumped.
+        assert_eq!(snap["shares_accepted"], 2);
+        assert_eq!(snap["shares_rejected"], 1);
     }
 
     // Byte-fidelity, block-found, double_sha256, hash_meets_target, and

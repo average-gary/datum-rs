@@ -63,8 +63,8 @@ use stratum_core::channels_sv2::extranonce_manager::{
 use stratum_core::mining_sv2::{
     NewExtendedMiningJob, NewMiningJob, OpenExtendedMiningChannel,
     OpenExtendedMiningChannelSuccess, OpenMiningChannelError, OpenStandardMiningChannel,
-    OpenStandardMiningChannelSuccess, SetNewPrevHash,
-    ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY,
+    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SubmitSharesError,
+    SubmitSharesSuccess, UpdateChannelError, ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY,
 };
 use stratum_core::parsers_sv2::Mining;
 use thiserror::Error;
@@ -97,6 +97,15 @@ pub enum MiningOut {
     NewExtendedMiningJob(NewExtendedMiningJob<'static>),
     NewMiningJob(NewMiningJob<'static>),
     SetNewPrevHash(SetNewPrevHash<'static>),
+    /// Phase 5 share-path output (batched ack). `channel_msg=true`.
+    SubmitSharesSuccess(SubmitSharesSuccess),
+    /// Phase 5 share-path output (per-share rejection). `channel_msg=true`.
+    SubmitSharesError(SubmitSharesError<'static>),
+    /// Phase 5 vardiff output. `channel_msg=true`.
+    SetTarget(SetTarget<'static>),
+    /// Phase 5 reply to `UpdateChannel` when nominal hashrate is invalid.
+    /// `channel_msg=true`.
+    UpdateChannelError(UpdateChannelError<'static>),
 }
 
 impl MiningOut {
@@ -115,6 +124,10 @@ impl MiningOut {
             Self::NewExtendedMiningJob(m) => Mining::NewExtendedMiningJob(m),
             Self::NewMiningJob(m) => Mining::NewMiningJob(m),
             Self::SetNewPrevHash(m) => Mining::SetNewPrevHash(m),
+            Self::SubmitSharesSuccess(m) => Mining::SubmitSharesSuccess(m),
+            Self::SubmitSharesError(m) => Mining::SubmitSharesError(m),
+            Self::SetTarget(m) => Mining::SetTarget(m),
+            Self::UpdateChannelError(m) => Mining::UpdateChannelError(m),
         }
     }
 
@@ -125,7 +138,9 @@ impl MiningOut {
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
             MESSAGE_TYPE_NEW_MINING_JOB, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
             MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SET_TARGET,
+            MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+            MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
         };
         match self {
             Self::OpenExtendedMiningChannelSuccess(_) => {
@@ -138,6 +153,10 @@ impl MiningOut {
             Self::NewExtendedMiningJob(_) => MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
             Self::NewMiningJob(_) => MESSAGE_TYPE_NEW_MINING_JOB,
             Self::SetNewPrevHash(_) => MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+            Self::SubmitSharesSuccess(_) => MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
+            Self::SubmitSharesError(_) => MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
+            Self::SetTarget(_) => MESSAGE_TYPE_SET_TARGET,
+            Self::UpdateChannelError(_) => MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
         }
     }
 
@@ -150,7 +169,11 @@ impl MiningOut {
             | Self::OpenMiningChannelError(_) => false,
             Self::NewExtendedMiningJob(_)
             | Self::NewMiningJob(_)
-            | Self::SetNewPrevHash(_) => true,
+            | Self::SetNewPrevHash(_)
+            | Self::SubmitSharesSuccess(_)
+            | Self::SubmitSharesError(_)
+            | Self::SetTarget(_)
+            | Self::UpdateChannelError(_) => true,
         }
     }
 }
@@ -177,8 +200,9 @@ pub struct OpenedChannel {
     /// Negotiated `max_target` (LE-internal byte order). For Standard
     /// channels this is the device's `max_target`; for Extended channels
     /// likewise. The server-side initial `target` we issue is bounded by
-    /// this — for now we issue the device's requested `max_target` directly.
-    #[allow(dead_code)]
+    /// this — Phase 6's vardiff loop calls [`clamp_target_to_channel_max`]
+    /// to ensure a `SetTarget` we emit never lowers difficulty below what
+    /// the device is willing to accept.
     pub max_target_le: [u8; 32],
 }
 
@@ -338,12 +362,8 @@ impl ChannelManager {
             }
         };
 
-        match self.open_extended_inner(
-            request_id,
-            user_identity,
-            nominal_hash_rate,
-            max_target_le,
-        ) {
+        match self.open_extended_inner(request_id, user_identity, nominal_hash_rate, max_target_le)
+        {
             Ok(out) => out,
             Err(ChannelOpenError::Allocator(_)) => vec![MiningOut::OpenMiningChannelError(
                 open_error(request_id, "min-extranonce-size-too-large"),
@@ -453,12 +473,8 @@ impl ChannelManager {
             }
         };
 
-        match self.open_standard_inner(
-            request_id,
-            user_identity,
-            nominal_hash_rate,
-            max_target_le,
-        ) {
+        match self.open_standard_inner(request_id, user_identity, nominal_hash_rate, max_target_le)
+        {
             Ok(out) => out,
             Err(ChannelOpenError::Allocator(_)) => vec![MiningOut::OpenMiningChannelError(
                 open_error(request_id, "min-extranonce-size-too-large"),
@@ -756,6 +772,61 @@ fn str_from_str0255(s: &Str0255<'_>) -> Option<String> {
     std::str::from_utf8(bytes).ok().map(|s| s.to_string())
 }
 
+/// Clamp a vardiff-derived target (LE-internal bytes) to the channel's
+/// max_target. The wire-spec invariant is `current_target ≤ max_target`,
+/// where smaller-as-256bit-integer == easier-as-difficulty. If the proposed
+/// vardiff target is HIGHER than the channel's max (i.e. easier), it gets
+/// clamped down to `max_target` — the device explicitly refused to mine at
+/// anything easier. Per the [SV2 mining-protocol concept] §SetTarget §"server
+/// MUST NOT set a target above max_target".
+///
+/// Both inputs are 32-byte little-endian. Comparison is done by reading them
+/// as 256-bit big-endian integers (i.e. compare bytes from index 31 down to
+/// 0). Returns `proposed` clamped to `[0, max_target_le]`.
+pub fn clamp_target_to_channel_max(proposed_le: [u8; 32], max_target_le: [u8; 32]) -> [u8; 32] {
+    // Compare as big-endian: walk from MSB (byte index 31 in LE) down to LSB.
+    for i in (0..32).rev() {
+        if proposed_le[i] > max_target_le[i] {
+            return max_target_le;
+        }
+        if proposed_le[i] < max_target_le[i] {
+            return proposed_le;
+        }
+    }
+    // Equal — either is fine; return proposed.
+    proposed_le
+}
+
+#[cfg(test)]
+mod clamp_tests {
+    use super::*;
+
+    #[test]
+    fn clamp_returns_max_when_proposed_higher() {
+        // proposed > max → clamp.
+        let mut proposed = [0u8; 32];
+        proposed[31] = 0xff;
+        let max = [0xaau8; 32];
+        let out = clamp_target_to_channel_max(proposed, max);
+        assert_eq!(out, max);
+    }
+
+    #[test]
+    fn clamp_returns_proposed_when_below_max() {
+        let proposed = [0x55u8; 32];
+        let max = [0xffu8; 32];
+        let out = clamp_target_to_channel_max(proposed, max);
+        assert_eq!(out, proposed);
+    }
+
+    #[test]
+    fn clamp_returns_proposed_when_equal() {
+        let v = [0x42u8; 32];
+        let out = clamp_target_to_channel_max(v, v);
+        assert_eq!(out, v);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -837,7 +908,11 @@ mod tests {
             min_extranonce_size: 8,
         };
         let out = mgr.handle_open_extended_mining_channel(msg);
-        assert_eq!(out.len(), 3, "expected Success + NewExtJob + SetNewPrevHash");
+        assert_eq!(
+            out.len(),
+            3,
+            "expected Success + NewExtJob + SetNewPrevHash"
+        );
         match (&out[0], &out[1], &out[2]) {
             (
                 MiningOut::OpenExtendedMiningChannelSuccess(s),
@@ -866,7 +941,11 @@ mod tests {
         let mut mgr = manager_with_template();
         let msg = OpenStandardMiningChannel {
             request_id: stratum_core::binary_sv2::U32AsRef::from(7u32),
-            user_identity: "bitaxe.worker1".to_string().into_bytes().try_into().unwrap(),
+            user_identity: "bitaxe.worker1"
+                .to_string()
+                .into_bytes()
+                .try_into()
+                .unwrap(),
             nominal_hash_rate: 1.3e12,
             max_target: U256::from([0xffu8; 32]),
         };
@@ -1061,4 +1140,3 @@ mod tests {
         assert_eq!(snph.prev_hash.inner_as_ref()[1], 0x0d);
     }
 }
-

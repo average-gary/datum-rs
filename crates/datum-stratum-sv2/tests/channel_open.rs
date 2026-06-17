@@ -103,7 +103,11 @@ fn standard_open_yields_three_messages_with_merkle_root_dependent_on_prefix() {
     let (mut mgr, _t) = fresh_manager_with_template();
     let out = mgr.handle_open_standard_mining_channel(OpenStandardMiningChannel {
         request_id: U32AsRef::from(7u32),
-        user_identity: "bitaxe.worker-1".to_string().into_bytes().try_into().unwrap(),
+        user_identity: "bitaxe.worker-1"
+            .to_string()
+            .into_bytes()
+            .try_into()
+            .unwrap(),
         nominal_hash_rate: 1.3e12,
         max_target: U256::from([0xffu8; 32]),
     });
@@ -123,7 +127,11 @@ fn standard_open_yields_three_messages_with_merkle_root_dependent_on_prefix() {
     // so a different extranonce_prefix MUST yield a different merkle_root.
     let out = mgr.handle_open_standard_mining_channel(OpenStandardMiningChannel {
         request_id: U32AsRef::from(8u32),
-        user_identity: "bitaxe.worker-2".to_string().into_bytes().try_into().unwrap(),
+        user_identity: "bitaxe.worker-2"
+            .to_string()
+            .into_bytes()
+            .try_into()
+            .unwrap(),
         nominal_hash_rate: 1.3e12,
         max_target: U256::from([0xffu8; 32]),
     });
