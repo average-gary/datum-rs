@@ -63,8 +63,9 @@ use stratum_core::channels_sv2::extranonce_manager::{
 use stratum_core::mining_sv2::{
     NewExtendedMiningJob, NewMiningJob, OpenExtendedMiningChannel,
     OpenExtendedMiningChannelSuccess, OpenMiningChannelError, OpenStandardMiningChannel,
-    OpenStandardMiningChannelSuccess, SetNewPrevHash, SetTarget, SubmitSharesError,
-    SubmitSharesSuccess, UpdateChannelError, ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY,
+    OpenStandardMiningChannelSuccess, SetCustomMiningJobError, SetNewPrevHash, SetTarget,
+    SubmitSharesError, SubmitSharesSuccess, UpdateChannelError,
+    ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY,
 };
 use stratum_core::parsers_sv2::Mining;
 use thiserror::Error;
@@ -106,6 +107,13 @@ pub enum MiningOut {
     /// Phase 5 reply to `UpdateChannel` when nominal hashrate is invalid.
     /// `channel_msg=true`.
     UpdateChannelError(UpdateChannelError<'static>),
+    /// Phase 5 reply to an unsolicited `SetCustomMiningJob` (msg 0x22).
+    /// datum-rs rejects `REQUIRES_WORK_SELECTION` at SetupConnection so a
+    /// well-behaved client never reaches this; a malformed/malicious peer
+    /// previously tripped `unreachable!()` and used to panic the per-conn
+    /// task. We reply with `error_code = "jd-not-supported"` and keep the
+    /// connection alive instead. `channel_msg=true`.
+    SetCustomMiningJobError(SetCustomMiningJobError<'static>),
 }
 
 impl MiningOut {
@@ -128,6 +136,7 @@ impl MiningOut {
             Self::SubmitSharesError(m) => Mining::SubmitSharesError(m),
             Self::SetTarget(m) => Mining::SetTarget(m),
             Self::UpdateChannelError(m) => Mining::UpdateChannelError(m),
+            Self::SetCustomMiningJobError(m) => Mining::SetCustomMiningJobError(m),
         }
     }
 
@@ -138,7 +147,8 @@ impl MiningOut {
             MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
             MESSAGE_TYPE_NEW_MINING_JOB, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
             MESSAGE_TYPE_OPEN_MINING_CHANNEL_ERROR,
-            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SET_TARGET,
+            MESSAGE_TYPE_OPEN_STANDARD_MINING_CHANNEL_SUCCESS,
+            MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR, MESSAGE_TYPE_SET_TARGET,
             MESSAGE_TYPE_SUBMIT_SHARES_ERROR, MESSAGE_TYPE_SUBMIT_SHARES_SUCCESS,
             MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
         };
@@ -157,6 +167,7 @@ impl MiningOut {
             Self::SubmitSharesError(_) => MESSAGE_TYPE_SUBMIT_SHARES_ERROR,
             Self::SetTarget(_) => MESSAGE_TYPE_SET_TARGET,
             Self::UpdateChannelError(_) => MESSAGE_TYPE_UPDATE_CHANNEL_ERROR,
+            Self::SetCustomMiningJobError(_) => MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR,
         }
     }
 
@@ -173,7 +184,8 @@ impl MiningOut {
             | Self::SubmitSharesSuccess(_)
             | Self::SubmitSharesError(_)
             | Self::SetTarget(_)
-            | Self::UpdateChannelError(_) => true,
+            | Self::UpdateChannelError(_)
+            | Self::SetCustomMiningJobError(_) => true,
         }
     }
 }

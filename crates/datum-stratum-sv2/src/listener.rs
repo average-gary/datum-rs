@@ -65,8 +65,8 @@ use crate::channel_manager::{ChannelManager, MiningOut};
 use crate::noise_stream::{NoiseStreamError, NoiseTcpStream, NOISE_HANDSHAKE_TIMEOUT};
 use crate::setup_connection::{handle_setup_connection, SetupConnectionResponse};
 use crate::share_path::{
-    build_submit_shares_error, build_submit_shares_success, handle_update_channel,
-    validate_extended_share, validate_standard_share, ShareOutcome,
+    build_submit_shares_error, build_submit_shares_success, handle_set_custom_mining_job,
+    handle_update_channel, validate_extended_share, validate_standard_share, ShareOutcome,
 };
 
 /// Outbound DATUM `0x27` share submission. Mirrors
@@ -470,13 +470,24 @@ async fn dispatch_frame(
         ) => {
             handle_submit_extended(rt, mgr, accounting, writer, share).await?;
         }
-        (MESSAGE_TYPE_SET_CUSTOM_MINING_JOB, AnyMessage::Mining(Mining::SetCustomMiningJob(_))) => {
+        (
+            MESSAGE_TYPE_SET_CUSTOM_MINING_JOB,
+            AnyMessage::Mining(Mining::SetCustomMiningJob(scmj)),
+        ) => {
             // We rejected REQUIRES_WORK_SELECTION at SetupConnection — a
-            // well-behaved client cannot reach this. A misbehaving one gets
-            // a tracing::warn and we drop the frame.
+            // well-behaved client cannot reach this. A malformed/malicious
+            // peer used to trip a defensive `unreachable!()` and panic the
+            // per-conn task; we now reply with a polite
+            // `SetCustomMiningJobError { error_code = "jd-not-supported" }`
+            // (per SRI `ERROR_CODE_SET_CUSTOM_MINING_JOB_JD_NOT_SUPPORTED`)
+            // and keep the connection alive.
             warn!(
-                "sv2: SetCustomMiningJob received after REQUIRES_WORK_SELECTION was rejected; ignoring"
+                channel_id = scmj.channel_id,
+                request_id = scmj.request_id,
+                "sv2: SetCustomMiningJob received but JD is not supported; replying with SetCustomMiningJobError"
             );
+            let err = handle_set_custom_mining_job(&scmj);
+            write_mining_frame(writer, MiningOut::SetCustomMiningJobError(err)).await?;
         }
         (mt, other) => {
             warn!(

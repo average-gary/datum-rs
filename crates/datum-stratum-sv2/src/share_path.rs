@@ -9,8 +9,12 @@
 //!   per-share `SubmitSharesError` with the SRI string error_code constants.
 //! - `handle_update_channel`: client-driven vardiff input. On valid hashrate
 //!   produces a `SetTarget` with `target.to_le_bytes()`.
-//! - `handle_set_custom_mining_job`: defensive `unreachable!()` — we reject
-//!   `REQUIRES_WORK_SELECTION` at SetupConnection so this should never fire.
+//! - `handle_set_custom_mining_job`: builds a [`SetCustomMiningJobError`]
+//!   reply (msg 0x24) with `error_code = "jd-not-supported"`. We reject
+//!   `REQUIRES_WORK_SELECTION` at SetupConnection so well-behaved peers never
+//!   send `SetCustomMiningJob` (msg 0x22); a malformed/malicious peer used to
+//!   trip a defensive `unreachable!()` and panic the per-connection task — we
+//!   now reply politely and keep the connection alive instead.
 //! - Server-driven vardiff loop: per-channel `VardiffState` measures observed
 //!   share rate; emits `SetTarget` on threshold cross. Same ×2/÷2 floor logic
 //!   SV1 uses.
@@ -43,10 +47,11 @@ use datum_share_relay::{
 use stratum_core::binary_sv2::{Str0255, U256};
 use stratum_core::channels_sv2::server::share_accounting::ShareAccounting;
 use stratum_core::mining_sv2::{
-    SetTarget, SubmitSharesError, SubmitSharesExtended, SubmitSharesStandard, SubmitSharesSuccess,
-    UpdateChannel, UpdateChannelError, ERROR_CODE_SUBMIT_SHARES_BAD_EXTRANONCE_SIZE,
-    ERROR_CODE_SUBMIT_SHARES_INVALID_JOB_ID, ERROR_CODE_SUBMIT_SHARES_INVALID_SHARE,
-    ERROR_CODE_UPDATE_CHANNEL_INVALID_CHANNEL_ID,
+    SetCustomMiningJob, SetCustomMiningJobError, SetTarget, SubmitSharesError,
+    SubmitSharesExtended, SubmitSharesStandard, SubmitSharesSuccess, UpdateChannel,
+    UpdateChannelError, ERROR_CODE_SET_CUSTOM_MINING_JOB_JD_NOT_SUPPORTED,
+    ERROR_CODE_SUBMIT_SHARES_BAD_EXTRANONCE_SIZE, ERROR_CODE_SUBMIT_SHARES_INVALID_JOB_ID,
+    ERROR_CODE_SUBMIT_SHARES_INVALID_SHARE, ERROR_CODE_UPDATE_CHANNEL_INVALID_CHANNEL_ID,
     ERROR_CODE_UPDATE_CHANNEL_INVALID_NOMINAL_HASHRATE, ERROR_CODE_VERSION_ROLLING_NOT_ALLOWED,
 };
 use tokio::sync::Mutex;
@@ -489,13 +494,38 @@ pub fn handle_update_channel(
     Ok(build_set_target(msg.channel_id, target_bytes))
 }
 
-/// Stub for `SetCustomMiningJob`. We reject `REQUIRES_WORK_SELECTION` at
-/// SetupConnection so this message should never reach the handler. Calling
-/// this is a logic bug in the dispatcher.
-pub fn handle_set_custom_mining_job_unreachable() -> ! {
-    unreachable!(
-        "SetCustomMiningJob received but datum-rs rejects REQUIRES_WORK_SELECTION at SetupConnection"
-    );
+/// Build a `SetCustomMiningJobError` (msg 0x24) reply for an unsolicited
+/// `SetCustomMiningJob` (msg 0x22).
+///
+/// datum-rs rejects `REQUIRES_WORK_SELECTION` at SetupConnection (Phase 3) so
+/// a well-behaved client never reaches this path. A misbehaving or malicious
+/// peer that sends `SetCustomMiningJob` post-Setup would previously trip a
+/// defensive `unreachable!()` and panic the per-connection task. Per SRI
+/// `mining_sv2::SetCustomMiningJobError` the wire shape is `{ channel_id,
+/// request_id, error_code }`; we use the SRI-defined
+/// [`ERROR_CODE_SET_CUSTOM_MINING_JOB_JD_NOT_SUPPORTED`] string `"jd-not-supported"`
+/// so SRI-compliant downstreams interpret the rejection correctly.
+///
+/// `channel_id` and `request_id` are echoed from the originating
+/// [`SetCustomMiningJob`] (per the SRI doc-comment, "matching responses from
+/// upstream").
+pub fn build_set_custom_mining_job_error(
+    channel_id: u32,
+    request_id: u32,
+) -> SetCustomMiningJobError<'static> {
+    SetCustomMiningJobError {
+        channel_id,
+        request_id,
+        error_code: err_code_str0255(ERROR_CODE_SET_CUSTOM_MINING_JOB_JD_NOT_SUPPORTED),
+    }
+}
+
+/// Convenience wrapper: pull `channel_id` / `request_id` straight off an
+/// incoming [`SetCustomMiningJob`] frame and produce the rejection reply.
+pub fn handle_set_custom_mining_job(
+    msg: &SetCustomMiningJob<'_>,
+) -> SetCustomMiningJobError<'static> {
+    build_set_custom_mining_job_error(msg.channel_id, msg.request_id)
 }
 
 /// `Arc<Mutex<JobTracker>>` shared between SV1 and SV2 share-relays. The
@@ -729,9 +759,43 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "REQUIRES_WORK_SELECTION")]
-    fn handle_set_custom_mining_job_panics_defensively() {
-        handle_set_custom_mining_job_unreachable();
+    fn build_set_custom_mining_job_error_uses_jd_not_supported_code() {
+        let err = build_set_custom_mining_job_error(42, 7);
+        assert_eq!(err.channel_id, 42);
+        assert_eq!(err.request_id, 7);
+        // Wire-string contract: SRI's ERROR_CODE_SET_CUSTOM_MINING_JOB_JD_NOT_SUPPORTED.
+        assert_eq!(err.error_code.inner_as_ref(), b"jd-not-supported");
+    }
+
+    #[test]
+    fn handle_set_custom_mining_job_echoes_channel_and_request_ids() {
+        // Build a synthetic SetCustomMiningJob with non-trivial ids; the
+        // handler must echo them verbatim per the SRI doc-comment ("matching
+        // responses from upstream").
+        use stratum_core::binary_sv2::{Seq0255, B0255, B064K};
+        let token: B0255<'static> = vec![0xAA, 0xBB].try_into().unwrap();
+        let coinbase_prefix: B0255<'static> = vec![0x03, 0x00].try_into().unwrap();
+        let coinbase_outputs: B064K<'static> = vec![0u8; 16].try_into().unwrap();
+        let merkle_path: Seq0255<'static, U256<'static>> = Seq0255::new(Vec::new()).unwrap();
+        let msg = SetCustomMiningJob {
+            channel_id: 0xdead_beef,
+            request_id: 0xfeed_face,
+            token,
+            version: 0x2000_0000,
+            prev_hash: U256::from([0u8; 32]),
+            min_ntime: 0,
+            nbits: 0,
+            coinbase_tx_version: 1,
+            coinbase_prefix,
+            coinbase_tx_input_n_sequence: 0xffff_ffff,
+            coinbase_tx_outputs: coinbase_outputs,
+            coinbase_tx_locktime: 0,
+            merkle_path,
+        };
+        let err = handle_set_custom_mining_job(&msg);
+        assert_eq!(err.channel_id, 0xdead_beef);
+        assert_eq!(err.request_id, 0xfeed_face);
+        assert_eq!(err.error_code.inner_as_ref(), b"jd-not-supported");
     }
 
     /// End-to-end share-validation smoke: synthetic share against a job in

@@ -29,16 +29,18 @@ use datum_share_relay::{JobTracker, ShareUserConfig};
 use datum_stratum_sv2::auth::{encode_authority_pubkey_b58, AuthorityKey};
 use datum_stratum_sv2::listener::{ListenerConfig, ListenerRuntime, UpstreamShareCommand};
 use datum_stratum_sv2::Listener;
-use stratum_core::binary_sv2::U256;
+use stratum_core::binary_sv2::{Seq0255, B0255, B064K, U256};
 use stratum_core::codec_sv2::{
     HandshakeRole, NoiseEncoder, StandardEitherFrame, StandardNoiseDecoder, StandardSv2Frame, State,
 };
 use stratum_core::common_messages_sv2::{Protocol, SetupConnection, MESSAGE_TYPE_SETUP_CONNECTION};
 use stratum_core::framing_sv2::framing::{HandShakeFrame, Sv2Frame};
 use stratum_core::mining_sv2::{
-    OpenExtendedMiningChannel, SubmitSharesExtended, MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
-    MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL,
-    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS, MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
+    OpenExtendedMiningChannel, SetCustomMiningJob, SubmitSharesExtended,
+    MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH, MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+    MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL, MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+    MESSAGE_TYPE_SET_CUSTOM_MINING_JOB, MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR,
+    MESSAGE_TYPE_SUBMIT_SHARES_EXTENDED,
 };
 use stratum_core::noise_sv2::Initiator;
 use stratum_core::parsers_sv2::{AnyMessage, CommonMessages, Mining};
@@ -268,6 +270,48 @@ impl TestClient {
         Ok(())
     }
 
+    /// Send a `SetCustomMiningJob` (msg 0x22) post-Setup. We rejected
+    /// `REQUIRES_WORK_SELECTION` at SetupConnection, so a well-behaved peer
+    /// would not do this — this simulates a malformed/malicious peer.
+    async fn send_set_custom_mining_job(
+        &mut self,
+        channel_id: u32,
+        request_id: u32,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let token: B0255<'static> = vec![0xAA, 0xBB, 0xCC].try_into().unwrap();
+        let coinbase_prefix: B0255<'static> = vec![0x03, 0x10, 0x27, 0x00].try_into().unwrap();
+        let coinbase_outputs: B064K<'static> = vec![0u8; 32].try_into().unwrap();
+        let merkle_path: Seq0255<'static, U256<'static>> = Seq0255::new(Vec::new()).unwrap();
+        let scmj = SetCustomMiningJob {
+            channel_id,
+            request_id,
+            token,
+            version: 0x2000_0000,
+            prev_hash: U256::from([0u8; 32]),
+            min_ntime: 0,
+            nbits: 0x1d00_ffff,
+            coinbase_tx_version: 1,
+            coinbase_prefix,
+            coinbase_tx_input_n_sequence: 0xffff_ffff,
+            coinbase_tx_outputs: coinbase_outputs,
+            coinbase_tx_locktime: 0,
+            merkle_path,
+        };
+        let frame: StandardSv2Frame<AnyMessage<'static>> = Sv2Frame::from_message(
+            AnyMessage::Mining(Mining::SetCustomMiningJob(scmj)),
+            MESSAGE_TYPE_SET_CUSTOM_MINING_JOB,
+            0,
+            true,
+        )
+        .ok_or("scmj build")?;
+        let buf = self
+            .encoder
+            .encode(StandardEitherFrame::Sv2(frame), &mut self.state)
+            .map_err(|e| format!("encode scmj: {e:?}"))?;
+        self.stream.write_all(buf.as_ref()).await?;
+        Ok(())
+    }
+
     async fn read_one(
         &mut self,
     ) -> Result<(u8, AnyMessage<'static>), Box<dyn std::error::Error + Send + Sync>> {
@@ -489,6 +533,162 @@ async fn dispatch_setup_open_submit_then_template_update() {
     assert!(
         got_snph_after,
         "template-update must re-emit SetNewPrevHash"
+    );
+
+    // Tear down.
+    server.abort();
+    let _ = std::fs::remove_file(&pub_path);
+    let _ = std::fs::remove_file(&sec_path);
+}
+
+/// Gap 2 dispatch integration test: a peer that sends `SetCustomMiningJob`
+/// (msg 0x22) post-Setup — even though we rejected `REQUIRES_WORK_SELECTION`
+/// at SetupConnection — must NOT panic the per-connection task. Instead the
+/// dispatcher replies with a `SetCustomMiningJobError` (msg 0x24,
+/// `error_code = "jd-not-supported"`) and the connection stays open.
+///
+/// Before Gap 2 the defensive `unreachable!()` at the SetCustomMiningJob
+/// branch would panic the per-conn task, drop the TCP socket, and the test
+/// client below would fail to receive an Sv2 frame.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dispatch_set_custom_mining_job_replies_error_keeps_connection_alive() {
+    let (pub_path, sec_path, pubkey) = make_authority_files();
+
+    let (upstream_tx, _upstream_rx) = mpsc::channel::<UpstreamShareCommand>(8);
+
+    let (publisher, sub) = TemplateStatePublisher::new();
+    publisher.publish(synth_state(1)).unwrap();
+
+    let jobs = Arc::new(Mutex::new(JobTracker::new()));
+
+    let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = probe.local_addr().unwrap();
+    drop(probe);
+
+    let cfg = ListenerConfig {
+        bind_addr: addr,
+        cert_validity: Duration::from_secs(60),
+        authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
+        handshake_timeout: Duration::from_secs(3),
+    };
+    let rt = ListenerRuntime {
+        cfg: Arc::new(cfg),
+        template_rx: sub.into_receiver(),
+        commands_tx: upstream_tx,
+        jobs: jobs.clone(),
+        user_cfg: ShareUserConfig {
+            pool_address: "bc1qpool".into(),
+            pass_full_users: false,
+            pass_workers: false,
+        },
+        block_found: None,
+    };
+    let listener = Listener::bind_with_runtime(rt).await.expect("bind");
+    let server = tokio::spawn(listener.run());
+
+    // Drive the initiator.
+    let mut client = TestClient::connect(addr, pubkey).await.expect("connect");
+    client.send_setup().await.expect("send setup");
+
+    // Read SetupConnection.Success.
+    let (mt, msg) = client.read_one().await.expect("setup reply");
+    assert_eq!(
+        mt,
+        stratum_core::common_messages_sv2::MESSAGE_TYPE_SETUP_CONNECTION_SUCCESS
+    );
+    assert!(matches!(
+        msg,
+        AnyMessage::Common(CommonMessages::SetupConnectionSuccess(_))
+    ));
+
+    // Open an Extended channel so we have a valid `channel_id` to echo in
+    // the SetCustomMiningJob.
+    client
+        .send_open_extended(11)
+        .await
+        .expect("send open extended");
+    let mut channel_id: u32 = 0;
+    for _ in 0..3 {
+        let (mt, msg) = client.read_one().await.expect("open reply frame");
+        if let (
+            MESSAGE_TYPE_OPEN_EXTENDED_MINING_CHANNEL_SUCCESS,
+            AnyMessage::Mining(Mining::OpenExtendedMiningChannelSuccess(s)),
+        ) = (mt, msg)
+        {
+            channel_id = s.channel_id;
+        }
+    }
+    assert!(channel_id != 0, "channel open must succeed");
+
+    // Now send an unsolicited SetCustomMiningJob — simulating a malicious /
+    // malformed peer.
+    let scmj_request_id = 0x1234_5678u32;
+    client
+        .send_set_custom_mining_job(channel_id, scmj_request_id)
+        .await
+        .expect("send SetCustomMiningJob");
+
+    // The server must reply with SetCustomMiningJobError (msg 0x24) — NOT
+    // panic, NOT close the socket, NOT silently drop.
+    let (mt, msg) = tokio::time::timeout(Duration::from_secs(3), client.read_one())
+        .await
+        .expect("SetCustomMiningJobError frame timeout — connection task may have panicked")
+        .expect("SetCustomMiningJobError read");
+    assert_eq!(
+        mt, MESSAGE_TYPE_SET_CUSTOM_MINING_JOB_ERROR,
+        "expected SetCustomMiningJobError msg type 0x24, got {mt:#04x}"
+    );
+    match msg {
+        AnyMessage::Mining(Mining::SetCustomMiningJobError(err)) => {
+            assert_eq!(err.channel_id, channel_id, "channel_id must echo back");
+            assert_eq!(err.request_id, scmj_request_id, "request_id must echo back");
+            assert_eq!(
+                err.error_code.inner_as_ref(),
+                b"jd-not-supported",
+                "error_code must be SRI's ERROR_CODE_SET_CUSTOM_MINING_JOB_JD_NOT_SUPPORTED"
+            );
+        }
+        other => panic!("expected SetCustomMiningJobError, got {other:?}"),
+    }
+
+    // Connection must stay alive — drive a TemplateState transition through
+    // the publisher and assert we still receive the (NewExtendedMiningJob,
+    // SetNewPrevHash) re-emission. If the per-conn task had panicked, the
+    // socket would be closed and read_one() would EOF instead of returning
+    // a frame.
+    publisher.publish(synth_state(2)).unwrap();
+    let mut got_new_job_after = false;
+    let mut got_snph_after = false;
+    for _ in 0..2 {
+        let (mt, msg) = tokio::time::timeout(Duration::from_secs(3), client.read_one())
+            .await
+            .expect("post-SCMJ template-update frame timeout — task panicked?")
+            .expect("post-SCMJ template-update read");
+        match (mt, msg) {
+            (
+                MESSAGE_TYPE_NEW_EXTENDED_MINING_JOB,
+                AnyMessage::Mining(Mining::NewExtendedMiningJob(_)),
+            ) => got_new_job_after = true,
+            (
+                MESSAGE_TYPE_MINING_SET_NEW_PREV_HASH,
+                AnyMessage::Mining(Mining::SetNewPrevHash(_)),
+            ) => got_snph_after = true,
+            (mt, m) => panic!("post-SCMJ unexpected frame mt={mt:#04x} msg={m:?}"),
+        }
+    }
+    assert!(
+        got_new_job_after,
+        "connection must stay alive: NewExtendedMiningJob expected after SCMJ rejection"
+    );
+    assert!(
+        got_snph_after,
+        "connection must stay alive: SetNewPrevHash expected after SCMJ rejection"
+    );
+
+    // Server task must still be running (no panic).
+    assert!(
+        !server.is_finished(),
+        "listener accept loop must not have stopped"
     );
 
     // Tear down.
