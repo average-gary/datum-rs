@@ -11,6 +11,7 @@ repository.workspace = true
 datum-blocktemplates = { path = "../datum-blocktemplates" }
 datum-coinbaser = { path = "../datum-coinbaser" }
 datum-dupes = { path = "../datum-dupes" }
+stratum-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }

@@ -6,14 +6,20 @@
 //! - Channel registry (concurrent map keyed by channel_id): shipped + tested.
 //! - Cross-protocol golden-vector helper (asserts SV1 + SV2 paths produce
 //!   the same coinbase output sum given identical inputs): shipped + tested.
-//! - SRI `channels_sv2`/`handlers_sv2` integration: **deferred**. SRI is
-//!   pinned at Rust 1.75 in master; we run on 1.89, and pulling SRI as a
-//!   git dependency is a major fan-out (own MSRV, own deps tree, own
-//!   transitive risks). The integration plan: pin a specific SRI rev in
-//!   `Cargo.toml`, swap `InMemoryJobStore<Job>` for SRI's
-//!   `DefaultJobStore<ExtendedJob>`, replace our `Channel` registry with
-//!   `channels_sv2::server::extended::ExtendedChannel::new_for_pool`. The
-//!   structural surface here matches the SRI shape so the swap is
+//! - SRI `channels_sv2`/`handlers_sv2` integration: **wiring in progress**.
+//!   SRI's library MSRV is 1.75 and its apps MSRV is 1.85; datum-rs runs on
+//!   1.89 — Rust is forward-compatible, so the MSRV gap is not a blocker.
+//!   The actual prerequisites are (a) pin a specific `stratum-core` git rev
+//!   in the workspace `Cargo.toml`, and (b) align our type names with the
+//!   current SRI shape. The integration plan: keep `InMemoryJobStore` for
+//!   tests but route the live channel state through SRI's `JobStore` trait
+//!   (default impl in `stratum_core::channels_sv2::server::jobs::job_store`)
+//!   and replace our `Channel` registry with
+//!   `stratum_core::channels_sv2::server::extended::ExtendedChannel::new_for_pool`.
+//!   Per-channel job assembly uses SRI's `JobFactory`
+//!   (`channels_sv2::server::jobs::factory`); the client-side dispatch
+//!   trait is `stratum_core::handlers_sv2::HandleMiningMessagesFromClientAsync`.
+//!   The structural surface here matches the SRI shape so the swap is
 //!   localized to two places.
 
 use std::collections::HashMap;
@@ -153,8 +159,9 @@ impl ExtendedJob {
     }
 }
 
-/// JobStore trait — abstracts the SRI `JobStore` shape so we can swap an SRI
-/// implementation in without touching the channel handlers.
+/// JobStore trait — abstracts the SRI `JobStore` shape (trait + default impl
+/// in `stratum_core::channels_sv2::server::jobs::job_store`) so we can swap
+/// an SRI implementation in without touching the channel handlers.
 pub trait JobStore: Send + Sync {
     fn put(&mut self, job: ExtendedJob);
     fn get(&self, job_id: u32) -> Option<&ExtendedJob>;
@@ -211,8 +218,15 @@ impl JobStore for InMemoryJobStore {
 }
 
 /// Channel registry — `HashMap<channel_id, ChannelState>` behind a tokio Mutex.
-/// Mirrors the shape SRI's `ExtendedChannel<DefaultJobStore<ExtendedJob>>`
-/// would occupy, while keeping our structural API independent.
+/// Mirrors the shape SRI's
+/// `stratum_core::channels_sv2::server::extended::ExtendedChannel` (composed
+/// with a `JobStore`-trait impl from
+/// `stratum_core::channels_sv2::server::jobs::job_store`) would occupy, while
+/// keeping our structural API independent. Per-job synthesis on the SRI side
+/// is driven by `JobFactory` in
+/// `stratum_core::channels_sv2::server::jobs::factory`; the client-message
+/// dispatch trait is
+/// `stratum_core::handlers_sv2::HandleMiningMessagesFromClientAsync`.
 #[derive(Debug)]
 pub struct ChannelState {
     pub channel_id: u32,
