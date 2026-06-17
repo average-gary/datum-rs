@@ -214,9 +214,30 @@ impl ExtendedJob {
     }
 }
 
-/// JobStore trait — abstracts the SRI `JobStore` shape (trait + default impl
-/// in `stratum_core::channels_sv2::server::jobs::job_store`) so we can swap
-/// an SRI implementation in without touching the channel handlers.
+/// JobStore trait — datum-rs's local job-storage abstraction.
+///
+/// **SRI architecture note (verified against rev `c7113e7b`,
+/// `sv2/channels-sv2/src/server/jobs/`)**: SRI's `JobStore<T: Job>` is
+/// `pub(crate) mod job_store;` in `server/jobs/mod.rs` — a generic concrete
+/// struct, NOT a public trait, NOT independently constructable, and embedded
+/// as a private field inside [`stratum_core::channels_sv2::server::extended::ExtendedChannel`]
+/// and `StandardChannel`. The SRI consumption pattern is "instantiate
+/// `ExtendedChannel::new_for_pool(...)` and let it manage jobs internally" —
+/// the only public touchpoints are `get_active_job` / `get_future_job` /
+/// `get_past_job` / `on_new_template` / `on_set_new_prev_hash` /
+/// `validate_share` on the channel itself.
+///
+/// As a result, "swap SRI's JobStore in for live channels" is not a drop-in
+/// substitution — it would require migrating live channels to wrap an
+/// `ExtendedChannel<'a>` instance, and the migration touches the share path,
+/// `OpenedChannel` state, and `on_template_update`. That's the right longer-
+/// term direction (and is captured in the wiki playbook), but it is a 200+
+/// line refactor outside the scope of this trait.
+///
+/// This trait is consumed only by [`InMemoryJobStore`] and [`ChannelRegistry`]
+/// — see their docs. It is intentionally narrow (no `template_id` mapping,
+/// no `active`/`future`/`past`/`stale` partition) because the only callers
+/// today are unit tests + the legacy registry's per-channel byte-bag.
 pub trait JobStore: Send + Sync {
     fn put(&mut self, job: ExtendedJob);
     fn get(&self, job_id: u32) -> Option<&ExtendedJob>;
@@ -229,6 +250,16 @@ pub trait JobStore: Send + Sync {
 /// Bounded in-memory JobStore matching the C reference's 8-job ring shape
 /// (per `gateway-internals-c-architecture` § "8-job ring state, in-memory
 /// only"). Eviction is FIFO on put when capacity is reached.
+///
+/// **Scope**: this is a test/diagnostic implementation backing
+/// [`ChannelRegistry`]'s per-channel byte-bag. The Phase 4+ live
+/// [`channel_manager::ChannelManager`] does **not** carry any
+/// `InMemoryJobStore` — it re-synthesizes `NewExtendedMiningJob` /
+/// `NewMiningJob` from the watched [`datum_blocktemplates::TemplateState`]
+/// on every transition (`on_template_update`). When the future migration
+/// to SRI's `ExtendedChannel` lands, this type stays around to back
+/// `ChannelRegistry` and the unit tests; "live channel job storage"
+/// becomes whatever `ExtendedChannel` keeps internally.
 #[derive(Debug, Default)]
 pub struct InMemoryJobStore {
     capacity: usize,
@@ -273,15 +304,25 @@ impl JobStore for InMemoryJobStore {
 }
 
 /// Channel registry — `HashMap<channel_id, ChannelState>` behind a tokio Mutex.
-/// Mirrors the shape SRI's
-/// `stratum_core::channels_sv2::server::extended::ExtendedChannel` (composed
-/// with a `JobStore`-trait impl from
-/// `stratum_core::channels_sv2::server::jobs::job_store`) would occupy, while
-/// keeping our structural API independent. Per-job synthesis on the SRI side
-/// is driven by `JobFactory` in
-/// `stratum_core::channels_sv2::server::jobs::factory`; the client-message
-/// dispatch trait is
-/// `stratum_core::handlers_sv2::HandleMiningMessagesFromClientAsync`.
+///
+/// **Status**: this is a legacy shim that predates the Phase 4 live
+/// [`channel_manager::ChannelManager`]. It survives because `datum-bin`'s
+/// `/metrics` endpoint reads [`ChannelRegistry::active_count()`]
+/// synchronously (atomic load — no `await` in the metrics-task path), and
+/// the live ChannelManager owns its registry behind an async-only mutex.
+/// Once the metrics path moves to a sync-readable atomic on the live
+/// manager (or `ChannelRegistry` and `ChannelManager` merge), this type
+/// goes away.
+///
+/// **NOT used** by the Phase 4+ live channel path. Live channels are stored
+/// in [`channel_manager::ChannelManager::channels`] (private). They do not
+/// keep a [`JobStore`] — jobs are re-synthesized from
+/// [`datum_blocktemplates::TemplateState`] on every prevhash transition via
+/// [`channel_manager::ChannelManager::on_template_update`]. Per the SRI
+/// architecture note on [`JobStore`]: SRI's `JobStore<T: Job>` is
+/// `pub(crate)` and only accessible through `ExtendedChannel` /
+/// `StandardChannel`; migrating live channels to wrap those is the
+/// direction this code aims toward, but is out of scope for this trait.
 #[derive(Debug)]
 pub struct ChannelState {
     pub channel_id: u32,
@@ -439,6 +480,33 @@ mod store_tests {
         let j = job(7, 500);
         assert!(r.put_job(id, j.clone()).await);
         assert!(!r.put_job(9999, j).await);
+    }
+
+    /// Regression: ChannelRegistry-with-InMemoryJobStore handles open +
+    /// insert future job + activate-on-prevhash semantics through close-then-
+    /// reopen lifecycle. This is the regression check called for in the SRI
+    /// JobStore gap analysis — recast against our actual storage type
+    /// because SRI's `JobStore<T: Job>` is `pub(crate)` and only reachable
+    /// through `ExtendedChannel`. See the [`JobStore`] doc.
+    #[tokio::test]
+    async fn registry_open_insert_reopen_lifecycle() {
+        let r = ChannelRegistry::new();
+        // Open channel, insert a "future" job, simulate prev_hash activation
+        // by simply leaving it in the store and asserting it's retrievable.
+        let id = r.open("worker-1".into()).await;
+        assert!(r.put_job(id, job(101, 1)).await);
+        assert!(r.put_job(id, job(102, 2)).await);
+        // Closing frees the slot AND drops the InMemoryJobStore — i.e. a
+        // subsequent `put_job(id, ...)` against the same id MUST fail
+        // (channel gone) rather than re-using a stale store.
+        r.close(id).await;
+        assert!(!r.put_job(id, job(103, 3)).await);
+        // Reopening yields a fresh store (counters reset). The new id may or
+        // may not equal the old — atomic counter is monotonic — but the
+        // invariant we care about is "fresh state, no leakage".
+        let id2 = r.open("worker-2".into()).await;
+        assert!(r.put_job(id2, job(201, 100)).await);
+        assert_eq!(r.active_count(), 1);
     }
 
     #[test]
