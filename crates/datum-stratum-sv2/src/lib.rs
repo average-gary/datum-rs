@@ -42,6 +42,7 @@ pub mod channel_manager;
 pub mod listener;
 pub mod noise_stream;
 pub mod setup_connection;
+pub mod share_path;
 
 pub use auth::{encode_authority_pubkey_b58, AuthorityKey, AuthorityKeyError};
 pub use channel_manager::{
@@ -50,6 +51,12 @@ pub use channel_manager::{
 };
 pub use listener::{Listener, ListenerConfig, ListenerError};
 pub use setup_connection::{handle_setup_connection, SetupConnectionResponse};
+pub use share_path::{
+    build_set_target, build_submit_shares_error, build_submit_shares_success,
+    build_update_channel_error, diff_to_target_le, handle_set_custom_mining_job_unreachable,
+    handle_update_channel, job_meta_from_template, validate_extended_share,
+    validate_standard_share, ShareOutcome, SharedJobTracker, VardiffParams, VardiffState,
+};
 
 /// Mirrors SRI's `handlers_sv2::mining::SupportedChannelTypes`. Re-exported
 /// here so callers don't need to depend on `stratum_core` to read the

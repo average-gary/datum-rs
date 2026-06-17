@@ -21,6 +21,7 @@ datum-dupes = { path = "../datum-dupes" }
 datum-logger = { path = "../datum-logger" }
 datum-protocol = { path = "../datum-protocol" }
 datum-rpc = { path = "../datum-rpc" }
+datum-share-relay = { path = "../datum-share-relay" }
 datum-stratum-sv1 = { path = "../datum-stratum-sv1" }
 datum-stratum-sv2 = { path = "../datum-stratum-sv2" }
 datum-submitblock = { path = "../datum-submitblock" }

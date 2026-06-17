@@ -589,6 +589,7 @@ dependencies = [
  "datum-logger",
  "datum-protocol",
  "datum-rpc",
+ "datum-share-relay",
  "datum-stratum-sv1",
  "datum-stratum-sv2",
  "datum-submitblock",
@@ -684,6 +685,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "datum-share-relay"
+version = "0.0.1"
+dependencies = [
+ "datum-protocol",
+ "datum-stratum-sv1",
+ "hex",
+ "sha2 0.10.9",
+ "thiserror",
+ "tracing",
+]
+
+[[package]]
 name = "datum-stratum-sv1"
 version = "0.0.1"
 dependencies = [
@@ -708,6 +721,8 @@ dependencies = [
  "datum-coinbaser",
  "datum-config",
  "datum-dupes",
+ "datum-protocol",
+ "datum-share-relay",
  "datum-stratum-sv1",
  "hex",
  "secp256k1 0.28.2",

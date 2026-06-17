@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -7,7 +6,10 @@ use std::sync::Arc;
 
 use datum_api::{ApiState, MetricsSource};
 use datum_config::{Config, ConfigError};
-use datum_stratum_sv1::assembler::JobMeta;
+use datum_share_relay::{
+    build_share_submission, JobKey, JobTracker, ShareEncoded, ShareUserConfig,
+    SubmittedShareInputs,
+};
 use serde_json::{json, Value};
 use tokio::sync::Mutex;
 
@@ -361,9 +363,10 @@ async fn run_async(cfg: Config) {
                 );
                 let target_pot_index = meta.target_pot_index;
                 let coinb1_bin_for_emit = meta.coinb1_bin.clone();
+                let template_seed = state.job_id_seed;
                 {
                     let mut g = jobs_for_assembler.lock().await;
-                    g.insert(job_id.clone(), meta);
+                    g.insert(JobKey::sv1(job_id.clone()), meta, template_seed);
                 }
                 let job = datum_stratum_sv1::server::NotifyJob::with_coinb1(
                     params.to_json_array(),
@@ -406,20 +409,41 @@ async fn run_async(cfg: Config) {
         let runtime_for_relay = runtime.clone();
         tokio::spawn(async move {
             while let Some(share) = submit_rx.recv().await {
-                // Per-miner diff is stamped on the SubmittedShare by the SV1
-                // server's vardiff loop.
-                let current_diff = share.current_diff;
+                let key = JobKey::sv1(share.job_id.clone());
                 let encoded = {
                     let mut g = jobs_for_relay.lock().await;
-                    let Some(entry) = g.get_mut(&share.job_id) else {
+                    if !g.contains(&key) {
                         tracing::warn!(
                             user = %share.username,
                             job = %share.job_id,
                             "share-relay: no JobEntry for job_id; dropping (likely stale or pre-notify share)"
                         );
                         continue;
+                    }
+                    let entry_version = g.get_mut(&key).expect("just checked").meta.version;
+                    let inputs = match sv1_share_to_inputs(&share, entry_version) {
+                        Ok(i) => i,
+                        Err(e) => {
+                            tracing::warn!(
+                                error = %e,
+                                "share-relay: input conversion failed; dropping submit"
+                            );
+                            continue;
+                        }
                     };
-                    match build_share_submission(&share, entry, &user_cfg_for_relay, current_diff) {
+                    // Snapshot template_seed + cross-protocol sentinel before
+                    // taking a mutable borrow on the entry.
+                    let template_seed = g.get_mut(&key).unwrap().template_seed;
+                    let coinbase_id = g.get_mut(&key).unwrap().meta.coinbase_id;
+                    let xprot_seen =
+                        g.cross_protocol_coinbase_already_seen(template_seed, coinbase_id);
+                    let entry = g.get_mut(&key).expect("contains() was true");
+                    let enc = match build_share_submission(
+                        &inputs,
+                        entry,
+                        &user_cfg_for_relay,
+                        xprot_seen,
+                    ) {
                         Ok(enc) => enc,
                         Err(e) => {
                             tracing::warn!(
@@ -428,7 +452,21 @@ async fn run_async(cfg: Config) {
                             );
                             continue;
                         }
+                    };
+                    // If we just emitted the 0x02 sub-block (entry's flag
+                    // flipped to true and xprot_seen was false), mark the
+                    // cross-protocol sentinel so a concurrent SV2 share for
+                    // the same (template_seed, coinbase) skips 0x02.
+                    if !xprot_seen
+                        && entry
+                            .server_has_coinbase
+                            .get(coinbase_id as usize)
+                            .copied()
+                            .unwrap_or(false)
+                    {
+                        g.mark_cross_protocol_coinbase_seen(template_seed, coinbase_id);
                     }
+                    enc
                 };
                 let ShareEncoded {
                     body,
@@ -574,76 +612,6 @@ async fn run_async(cfg: Config) {
         h.abort();
     }
     let _ = notify_tx;
-}
-
-/// Per-job context tracked by [`JobTracker`]. Wraps [`JobMeta`] with the
-/// "send-once-per-(job, coinbase_id)" flags the C reference uses to amortise
-/// the bulky 0x01 / 0x02 sub-blocks of the DATUM `0x27` share submission.
-#[derive(Debug)]
-struct JobEntry {
-    meta: JobMeta,
-    server_has_merkle_branches: bool,
-    server_has_coinbase: [bool; 8],
-}
-
-#[derive(Debug, Default)]
-struct JobTracker {
-    /// Bounded map keyed by the SV1 wire job-id (hex string emitted in
-    /// `mining.notify`). The C reference uses an 8-bit ring of 256 slots; we
-    /// model the same eviction explicitly via `order` queue.
-    by_job_id: HashMap<String, JobEntry>,
-    /// Insertion order — oldest entries are evicted when capacity is reached.
-    order: std::collections::VecDeque<String>,
-    /// 8-bit ring counter for `datum_job_idx`; wraps at 255.
-    next_datum_idx: u8,
-}
-
-impl JobTracker {
-    const MAX: usize = 256;
-
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn next_idx(&mut self) -> u8 {
-        let v = self.next_datum_idx;
-        self.next_datum_idx = self.next_datum_idx.wrapping_add(1);
-        v
-    }
-
-    fn insert(&mut self, job_id: String, meta: JobMeta) {
-        if self.by_job_id.len() >= Self::MAX {
-            if let Some(oldest) = self.order.pop_front() {
-                self.by_job_id.remove(&oldest);
-            }
-        }
-        self.order.push_back(job_id.clone());
-        self.by_job_id.insert(
-            job_id,
-            JobEntry {
-                meta,
-                server_has_merkle_branches: false,
-                server_has_coinbase: [false; 8],
-            },
-        );
-    }
-
-    fn get_mut(&mut self, job_id: &str) -> Option<&mut JobEntry> {
-        self.by_job_id.get_mut(job_id)
-    }
-
-    /// Clear every per-(job, coinbase_id) `server_has_*` send-once flag.
-    /// Called on DATUM upstream reconnect: the upstream's slot table is
-    /// state-on-the-wire, so when we lose+reestablish a connection the pool
-    /// has no record of any job we previously announced. The next share we
-    /// forward must carry the 0x01 + 0x02 sub-blocks again, otherwise OCEAN
-    /// rejects with BAD_JOB_ID (10).
-    fn reset_send_once_flags(&mut self) {
-        for entry in self.by_job_id.values_mut() {
-            entry.server_has_merkle_branches = false;
-            entry.server_has_coinbase = [false; 8];
-        }
-    }
 }
 
 async fn wait_for_shutdown() {
@@ -896,355 +864,39 @@ async fn run_datum_upstream(
     }
 }
 
-/// Configuration knobs the share-relay needs to format the username field of a
-/// DATUM `0x27` share submission.
-#[derive(Debug, Clone)]
-struct ShareUserConfig {
-    pool_address: String,
-    pass_full_users: bool,
-    pass_workers: bool,
-}
-
-/// Format the share's username field per `datum_protocol.c:1340-1351`. Three
-/// behaviors: both flags false OR no miner username uses the configured pool
-/// address; `pass_full_users` with a miner username that doesn't start with
-/// `.` uses the miner username verbatim; otherwise the result is
-/// `pool_address` joined with the miner username (with a `.` separator unless
-/// the miner already prefixed one). Cap at 384 bytes (matches the C
-/// `username[385]` buffer minus null).
-fn format_share_username(miner_user: &str, cfg: &ShareUserConfig) -> Vec<u8> {
-    let s = if (!cfg.pass_full_users && !cfg.pass_workers) || miner_user.is_empty() {
-        cfg.pool_address.clone()
-    } else if cfg.pass_full_users && !miner_user.starts_with('.') {
-        miner_user.to_string()
-    } else if cfg.pass_full_users || cfg.pass_workers {
-        let sep = if miner_user.starts_with('.') { "" } else { "." };
-        format!("{}{}{}", cfg.pool_address, sep, miner_user)
-    } else {
-        cfg.pool_address.clone()
-    };
-    let mut out = s.into_bytes();
-    out.truncate(384);
-    out
-}
-
-/// `floorPoT(x)`: position of the highest set bit; 0 for x=0. Mirrors
-/// `datum_utils.c::floorPoT`.
-fn floor_pot(x: u64) -> u8 {
-    if x == 0 {
-        0
-    } else {
-        (63 - x.leading_zeros()) as u8
-    }
-}
-
-/// Bitcoin double-SHA256: `sha256(sha256(x))` — both passes return 32 bytes.
-fn double_sha256(input: &[u8]) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let first = Sha256::digest(input);
-    Sha256::digest(first).into()
-}
-
-/// Walk the merkle tree from the coinbase outward. `coinb1_patched` MUST be
-/// the bytes the miner actually hashed (PoT byte already applied);
-/// `extranonce` is the 12-byte xn1||xn2 the miner concatenated. Branches in
-/// `branches` are stored in BIG-ENDIAN display order (matching what the SV1
-/// wire frame emits — see `assembler.rs::build_merkle_branch`); we reverse
-/// each one to internal byte order before concatenating, mirroring what the
-/// miner does. Returns the merkle root in INTERNAL byte order, ready to drop
-/// into header bytes 36..68 unchanged.
-fn compute_merkle_root(
-    coinb1_patched: &[u8],
-    extranonce: &[u8; 12],
-    coinb2: &[u8],
-    branches: &[[u8; 32]],
-) -> [u8; 32] {
-    let mut full_cb = Vec::with_capacity(coinb1_patched.len() + 12 + coinb2.len());
-    full_cb.extend_from_slice(coinb1_patched);
-    full_cb.extend_from_slice(extranonce);
-    full_cb.extend_from_slice(coinb2);
-    let mut acc = double_sha256(&full_cb);
-    let mut buf = [0u8; 64];
-    for sib in branches {
-        let mut sib_le = *sib;
-        sib_le.reverse(); // wire BE display -> internal LE
-        buf[..32].copy_from_slice(&acc);
-        buf[32..].copy_from_slice(&sib_le);
-        acc = double_sha256(&buf);
-    }
-    acc
-}
-
-/// Compare a candidate hash against a target, both in internal-LE byte order.
-/// Mirrors `datum_utils.c::compare_hashes`: walk from MSB (index 31) down,
-/// returning true iff `hash <= target`. A win means the hash is at-or-below
-/// the network target (i.e. a valid block).
-fn hash_meets_target(hash: &[u8; 32], target: &[u8; 32]) -> bool {
-    for i in (0..32).rev() {
-        match hash[i].cmp(&target[i]) {
-            std::cmp::Ordering::Less => return true,
-            std::cmp::Ordering::Greater => return false,
-            std::cmp::Ordering::Equal => continue,
-        }
-    }
-    true
-}
-
-/// Push a Bitcoin varint as hex characters onto `out`. Mirrors
-/// `assembler.rs::push_varint`'s byte form, hex-encoded inline.
-fn push_varint_hex(out: &mut String, v: u64) {
-    if v < 0xfd {
-        out.push_str(&format!("{:02x}", v as u8));
-    } else if v <= 0xffff {
-        out.push_str("fd");
-        out.push_str(&format!("{:02x}{:02x}", v as u8, (v >> 8) as u8));
-    } else if v <= 0xffff_ffff {
-        out.push_str("fe");
-        out.push_str(&hex::encode((v as u32).to_le_bytes()));
-    } else {
-        out.push_str("ff");
-        out.push_str(&hex::encode(v.to_le_bytes()));
-    }
-}
-
-/// Block-found context returned alongside the encoded share body when a share
-/// hash meets the network target. Caller is responsible for spawning the
-/// `BlockSubmitter::submit` task — path-1 (bitcoind submitblock) MUST run
-/// independently of path-2 (DATUM 0x27) per the architecture rule.
-#[derive(Debug, Clone)]
-struct BlockSubmissionPayload {
-    /// Full block hex: 80-byte header + varint(tx_count + 1) + full coinbase
-    /// + each `template.transactions[*].data` hex appended verbatim.
-    block_hex: String,
-    /// Block hash in big-endian display order — what bitcoind expects for
-    /// `preciousblock`.
-    block_hash_hex: String,
-}
-
-/// Encoded share output: the wire body for the DATUM 0x27 frame, plus an
-/// optional block-submission payload when the share's header hash meets the
-/// network target.
-#[derive(Debug)]
-struct ShareEncoded {
-    body: Vec<u8>,
-    block_submission: Option<BlockSubmissionPayload>,
-}
-
-/// Encode a `mining.submit` payload into a complete DATUM `0x27` share
-/// submission body, matching `datum_protocol.c::datum_protocol_pow:1313-1438`.
-///
-/// Layout: fixed 30-byte prefix, null-terminated username, 4 reserved zero
-/// bytes, optional 0x01 first-share-of-job block (prevhash, target byte index,
-/// nbits, datum_coinbaser_id, height, coinbase_value, four tx counts, and the
-/// merkle-branch table), optional 0x02 first-share-of-coinbase block
-/// (coinb1_len, coinb2_len, coinb1_bin, coinb2_bin), 0xFE cap, random padding
-/// of 1 to 80 bytes.
-///
-/// The 0x01 / 0x02 sub-blocks are sent ONCE per (job, coinbase_id); the
-/// `entry` flags track that. The runtime is responsible for never resetting
-/// these flags after a successful submit.
-fn build_share_submission(
-    share: &datum_stratum_sv1::server::SubmittedShare,
-    entry: &mut JobEntry,
-    user_cfg: &ShareUserConfig,
-    current_diff: u64,
-) -> Result<ShareEncoded, String> {
-    let ntime = parse_u32_be_hex(&share.ntime_hex).ok_or("invalid ntime hex")?;
-    let nonce = parse_u32_be_hex(&share.nonce_hex).ok_or("invalid nonce hex")?;
-    // BIP-310: the miner's nversion has been masked by the SV1 server against
-    // the negotiated mask before reaching us, so a plain OR is safe (mirrors
-    // `bver |= vroll_uint;` at datum_stratum.c:1068).
-    let mut version: u32 = entry.meta.version;
-    version |= share.version_rolling;
-
-    let extranonce2 = hex::decode(&share.extranonce2_hex).map_err(|e| e.to_string())?;
-    let mut extranonce = [0u8; 12];
-    extranonce[..4].copy_from_slice(&share.extranonce1);
-    let take = extranonce2.len().min(8);
-    extranonce[4..4 + take].copy_from_slice(&extranonce2[..take]);
-
-    // PoT target byte tied to the diff active at the LAST notify emit for
-    // this job_id (carried forward from the SV1 server's emit-time snapshot).
-    let target_byte = floor_pot(current_diff);
-
-    // Block-found check. Reconstruct the patched coinbase, double-SHA the
-    // 80-byte header, compare hash against the network target. Use the SAME
-    // patched coinb1 the miner hashed — sourced from the share's emit
-    // snapshot (or rebuild if absent for compatibility, though the relay
-    // should drop None upstream of this call).
-    let coinb1_patched = match share.patched_coinb1_bin.as_deref() {
-        Some(b) => b.to_vec(),
-        None => {
-            let mut b = entry.meta.coinb1_bin.clone();
-            let pot_index = entry.meta.target_pot_index as usize;
-            if pot_index < b.len() {
-                b[pot_index] = target_byte;
-            }
-            b
-        }
-    };
-    let merkle_root = compute_merkle_root(
-        &coinb1_patched,
-        &extranonce,
-        &entry.meta.coinb2_bin,
-        &entry.meta.merkle_branches_bin,
-    );
-    // Build 80-byte header in canonical Bitcoin layout (LE for version /
-    // ntime / nbits / nonce; internal-order for prevhash / merkle_root).
-    let mut header = [0u8; 80];
-    header[0..4].copy_from_slice(&version.to_le_bytes());
-    header[4..36].copy_from_slice(&entry.meta.prevhash_bin);
-    header[36..68].copy_from_slice(&merkle_root);
-    header[68..72].copy_from_slice(&ntime.to_le_bytes());
-    // meta.nbits_bin is BIG-ENDIAN display bytes; header offset 72..76 wants
-    // little-endian. Reverse on write.
-    let mut nbits_le = entry.meta.nbits_bin;
-    nbits_le.reverse();
-    header[72..76].copy_from_slice(&nbits_le);
-    header[76..80].copy_from_slice(&nonce.to_le_bytes());
-    let share_hash = double_sha256(&header);
-    let is_block = hash_meets_target(&share_hash, &entry.meta.block_target);
-    // Flags: bit0=is_block, bit1=subsidy_only, bit2=quickdiff. We don't run
-    // subsidy_only or quickdiff today.
-    const FLAG_IS_BLOCK: u8 = 0x01;
-    let flags: u8 = if is_block { FLAG_IS_BLOCK } else { 0 };
-
-    let prefix = datum_protocol::ShareSubmissionPrefix {
-        job_id: entry.meta.datum_job_idx,
-        coinbase_id: entry.meta.coinbase_id,
-        flags,
-        target_byte,
-        ntime,
-        nonce,
-        version,
-        extranonce,
-    };
-    let mut body = prefix.encode();
-
-    // Username (null-terminated). C uses snprintf which always writes a NUL.
-    let user_bytes = format_share_username(&share.username, user_cfg);
-    body.extend_from_slice(&user_bytes);
-    body.push(0);
-
-    // 4 reserved bytes (zero) for future use.
-    body.extend_from_slice(&[0u8; 4]);
-
-    // 0x01 sub-block: prevhash + nbits + height + coinbase_value + tx counts
-    // + merkle branches. Sent once per job until server has it.
-    if !entry.server_has_merkle_branches {
-        body.push(0x01);
-        body.extend_from_slice(&entry.meta.prevhash_bin);
-        body.extend_from_slice(&entry.meta.target_pot_index.to_le_bytes());
-        // C ships sjob->nbits_bin verbatim and that buffer is the RPC hex
-        // reversed (datum_blocktemplates.c:252 `bits_bin[3-i] = hex2bin_uchar(...)`)
-        // = internal LE. Our JobMeta stores BE display order, so reverse.
-        let mut nbits_le = entry.meta.nbits_bin;
-        nbits_le.reverse();
-        body.extend_from_slice(&nbits_le);
-        body.push(entry.meta.datum_coinbaser_id);
-        body.extend_from_slice(&entry.meta.height.to_le_bytes());
-        body.extend_from_slice(&entry.meta.coinbase_value.to_le_bytes());
-        body.extend_from_slice(&entry.meta.txn_count.to_le_bytes());
-        body.extend_from_slice(&entry.meta.txn_total_weight.to_le_bytes());
-        body.extend_from_slice(&entry.meta.txn_total_size.to_le_bytes());
-        body.extend_from_slice(&entry.meta.txn_total_sigops.to_le_bytes());
-        body.push(entry.meta.merkle_branches_bin.len() as u8);
-        // C ships merklebranches_bin in INTERNAL byte order: txid_bin is built
-        // via hex_to_bin_le (RPC hex reversed) and higher levels are raw
-        // double_sha256 outputs (already internal). Our JobMeta stores them in
-        // BE display order to match the SV1 wire frame, so reverse here.
-        for branch in &entry.meta.merkle_branches_bin {
-            let mut le = *branch;
-            le.reverse();
-            body.extend_from_slice(&le);
-        }
-        entry.server_has_merkle_branches = true;
-    }
-
-    // 0x02 sub-block: full coinb1/coinb2 binaries. Sent once per (job,
-    // coinbase_id) until server has it.
-    //
-    // C ships sjob->coinbase[id].coinb1_bin verbatim — the TEMPLATE-ORIGINAL
-    // coinb1 with the 0xFF PoT placeholder still in place at target_pot_index
-    // (datum_protocol.c:1417, datum_coinbaser.c:165/171). The server applies
-    // floorPoT(diff) at target_pot_index itself when reconstructing the
-    // miner's hash; sending a pre-patched coinb1 desyncs that.
-    let cb_id = entry.meta.coinbase_id as usize;
-    let already_sent_coinbase =
-        cb_id < entry.server_has_coinbase.len() && entry.server_has_coinbase[cb_id];
-    if !already_sent_coinbase {
-        body.push(0x02);
-        body.push(entry.meta.coinbase_id);
-        let cb1_len = entry.meta.coinb1_bin.len() as u16;
-        let cb2_len = entry.meta.coinb2_bin.len() as u16;
-        body.extend_from_slice(&cb1_len.to_le_bytes());
-        body.extend_from_slice(&cb2_len.to_le_bytes());
-        body.extend_from_slice(&entry.meta.coinb1_bin);
-        body.extend_from_slice(&entry.meta.coinb2_bin);
-        if cb_id < entry.server_has_coinbase.len() {
-            entry.server_has_coinbase[cb_id] = true;
-        }
-    }
-
-    // Cap byte.
-    body.push(0xFE);
-
-    // Random padding 1-80 bytes (matches C's `1 + (rand() % 80)` plus repeat
-    // of a single random byte). Use a counter-derived "random" since the C
-    // path also doesn't seed from CSPRNG — this is purely traffic-shape
-    // obfuscation and doesn't need cryptographic strength.
-    let rb = padding_byte();
-    let pad_len = 1 + (rb as usize % 80);
-    body.extend(std::iter::repeat_n(rb, pad_len));
-
-    let block_submission = if is_block {
-        let mut hash_be = share_hash;
-        hash_be.reverse();
-        let block_hash_hex = hex::encode(hash_be);
-
-        let mut full_cb =
-            Vec::with_capacity(coinb1_patched.len() + 12 + entry.meta.coinb2_bin.len());
-        full_cb.extend_from_slice(&coinb1_patched);
-        full_cb.extend_from_slice(&extranonce);
-        full_cb.extend_from_slice(&entry.meta.coinb2_bin);
-
-        // Block hex: header + varint(tx_count + 1) + coinbase + each tx.data.
-        let txn_count = entry.meta.txn_count as u64;
-        let mut block_hex = String::with_capacity(160 + full_cb.len() * 2 + 200_000);
-        block_hex.push_str(&hex::encode(header));
-        push_varint_hex(&mut block_hex, txn_count + 1);
-        block_hex.push_str(&hex::encode(&full_cb));
-        for tx_hex in entry.meta.txn_data_hex.iter() {
-            block_hex.push_str(tx_hex);
-        }
-        Some(BlockSubmissionPayload {
-            block_hex,
-            block_hash_hex,
-        })
-    } else {
-        None
-    };
-
-    Ok(ShareEncoded {
-        body,
-        block_submission,
-    })
-}
-
+/// Parse a big-endian u32 hex string (with or without the `0x` prefix).
 fn parse_u32_be_hex(s: &str) -> Option<u32> {
     let trimmed = s.strip_prefix("0x").unwrap_or(s);
     u32::from_str_radix(trimmed, 16).ok()
 }
 
-fn padding_byte() -> u8 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static STATE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
-    let mut x = STATE.load(Ordering::Relaxed);
-    x ^= x << 13;
-    x ^= x >> 7;
-    x ^= x << 17;
-    STATE.store(x, Ordering::Relaxed);
-    (x & 0xFF) as u8
+/// Build [`SubmittedShareInputs`] from an SV1 [`SubmittedShare`]. Hoists the
+/// pre-Phase-5 inline conversion that lived in the share-relay loop so the
+/// shared `build_share_submission` builder gets a protocol-neutral input
+/// regardless of which protocol delivered the share.
+fn sv1_share_to_inputs(
+    share: &datum_stratum_sv1::server::SubmittedShare,
+    entry_version: u32,
+) -> Result<SubmittedShareInputs, String> {
+    let ntime = parse_u32_be_hex(&share.ntime_hex).ok_or("invalid ntime hex")?;
+    let nonce = parse_u32_be_hex(&share.nonce_hex).ok_or("invalid nonce hex")?;
+    // BIP-310: SV1 server already masked the version-rolling bits against the
+    // negotiated mask. Plain OR is safe.
+    let version: u32 = entry_version | share.version_rolling;
+    let extranonce2 = hex::decode(&share.extranonce2_hex).map_err(|e| e.to_string())?;
+    let mut extranonce = [0u8; 12];
+    extranonce[..4].copy_from_slice(&share.extranonce1);
+    let take = extranonce2.len().min(8);
+    extranonce[4..4 + take].copy_from_slice(&extranonce2[..take]);
+    Ok(SubmittedShareInputs {
+        username: share.username.clone(),
+        extranonce,
+        ntime,
+        nonce,
+        version,
+        current_diff: share.current_diff,
+        patched_coinb1_bin: share.patched_coinb1_bin.clone(),
+    })
 }
 
 async fn maybe_request_coinbaser(
@@ -1545,278 +1197,8 @@ mod tests {
         assert_eq!(snap["blocks_found"], 1);
     }
 
-    #[test]
-    fn double_sha256_known_vector() {
-        // Bitcoin genesis block coinbase tx hash — well-known test vector.
-        // Empty input double-sha256 ends in d2 1b cf bd ef cf b1 fb (known
-        // first bytes of `sha256(sha256("")))`).
-        let h = double_sha256(b"");
-        // Hex of sha256d("") = 5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456
-        assert_eq!(
-            hex::encode(h),
-            "5df6e0e2761359d30a8275058e299fcc0381534545f55cf43e41983f5d4c9456"
-        );
-    }
-
-    #[test]
-    fn hash_meets_target_walks_msb_down() {
-        // MSB byte controls the comparison.
-        let mut hash = [0u8; 32];
-        let mut target = [0u8; 32];
-        // hash MSB < target MSB → meets.
-        hash[31] = 0x10;
-        target[31] = 0x20;
-        assert!(hash_meets_target(&hash, &target));
-        // hash MSB > target MSB → fails.
-        hash[31] = 0x30;
-        assert!(!hash_meets_target(&hash, &target));
-        // Equal MSB but lower byte decides → meets.
-        hash[31] = 0x20;
-        hash[30] = 0x05;
-        target[30] = 0x10;
-        assert!(hash_meets_target(&hash, &target));
-        // Equal everywhere → meets (boundary).
-        let z = [0u8; 32];
-        assert!(hash_meets_target(&z, &z));
-    }
-
-    #[test]
-    fn compute_merkle_root_no_branches_is_double_sha_of_full_cb() {
-        let coinb1 = vec![0xaa; 30];
-        let xn = [0xbbu8; 12];
-        let coinb2 = vec![0xccu8; 20];
-        let mut full = Vec::new();
-        full.extend_from_slice(&coinb1);
-        full.extend_from_slice(&xn);
-        full.extend_from_slice(&coinb2);
-        let expected = double_sha256(&full);
-        let got = compute_merkle_root(&coinb1, &xn, &coinb2, &[]);
-        assert_eq!(got, expected);
-    }
-
-    #[test]
-    fn push_varint_hex_thresholds() {
-        let mut s = String::new();
-        push_varint_hex(&mut s, 0);
-        assert_eq!(s, "00");
-        s.clear();
-        push_varint_hex(&mut s, 0xfc);
-        assert_eq!(s, "fc");
-        s.clear();
-        push_varint_hex(&mut s, 0xfd);
-        assert_eq!(s, "fdfd00");
-        s.clear();
-        push_varint_hex(&mut s, 0xffff);
-        assert_eq!(s, "fdffff");
-        s.clear();
-        push_varint_hex(&mut s, 0x10000);
-        assert_eq!(s, "fe00000100");
-    }
-
-    fn synthetic_job_entry(target: [u8; 32]) -> JobEntry {
-        JobEntry {
-            meta: JobMeta {
-                datum_job_idx: 0,
-                coinbase_id: 0,
-                target_pot_index: 0,
-                version: 0x20000000,
-                height: 1,
-                coinbase_value: 5_000_000_000,
-                prevhash_bin: [0u8; 32],
-                nbits_bin: [0x20, 0x7f, 0xff, 0xff], // BE display "207fffff"
-                merkle_branches_bin: vec![],
-                coinb1_bin: vec![0u8; 50],
-                coinb2_bin: vec![0u8; 10],
-                datum_coinbaser_id: 0,
-                txn_count: 0,
-                txn_total_weight: 0,
-                txn_total_size: 0,
-                txn_total_sigops: 0,
-                block_target: target,
-                txn_data_hex: std::sync::Arc::new(vec![]),
-            },
-            server_has_merkle_branches: false,
-            server_has_coinbase: [false; 8],
-        }
-    }
-
-    fn synthetic_share() -> datum_stratum_sv1::server::SubmittedShare {
-        datum_stratum_sv1::server::SubmittedShare {
-            username: "bc1q".into(),
-            job_id: "job-1".into(),
-            extranonce2_hex: "0000000000000000".into(),
-            ntime_hex: "00000000".into(),
-            nonce_hex: "00000000".into(),
-            extranonce1: [0u8; 4],
-            version_rolling: 0,
-            current_diff: 1,
-            patched_coinb1_bin: Some(vec![0u8; 50]),
-        }
-    }
-
-    #[test]
-    fn block_found_when_target_is_max() {
-        // target = all 0xFF means every share-hash <= target → is_block.
-        let mut entry = synthetic_job_entry([0xFFu8; 32]);
-        let share = synthetic_share();
-        let user = ShareUserConfig {
-            pool_address: "bc1qpool".into(),
-            pass_full_users: false,
-            pass_workers: false,
-        };
-        let enc = build_share_submission(&share, &mut entry, &user, 1).unwrap();
-        assert!(enc.block_submission.is_some(), "should detect block");
-        let payload = enc.block_submission.unwrap();
-        // 80-byte header = 160 hex chars at the front of block_hex.
-        assert!(payload.block_hex.len() >= 160);
-        // Hash hex is 64 chars (32 bytes display).
-        assert_eq!(payload.block_hash_hex.len(), 64);
-        // Body must encode the is_block flag bit.
-        // Prefix layout: see ShareSubmissionPrefix; flags is one byte. We
-        // don't reproduce the exact offset here — round-trip test covers it
-        // upstream. Just assert non-empty body.
-        assert!(!enc.body.is_empty());
-    }
-
-    #[test]
-    fn no_block_when_target_is_zero() {
-        // target = all zero means NO share-hash can meet it.
-        let mut entry = synthetic_job_entry([0u8; 32]);
-        let share = synthetic_share();
-        let user = ShareUserConfig {
-            pool_address: "bc1qpool".into(),
-            pass_full_users: false,
-            pass_workers: false,
-        };
-        let enc = build_share_submission(&share, &mut entry, &user, 1).unwrap();
-        assert!(enc.block_submission.is_none());
-    }
-
-    /// Byte-fidelity gate. Pins the EXACT 0x27 body bytes for a deterministic
-    /// input vector (everything up to and including the 0xFE cap). The trailing
-    /// padding is non-deterministic (xorshift static state shared across the
-    /// process) so we only check pad-shape invariants.
-    #[test]
-    fn share_submission_body_byte_fidelity() {
-        let mut entry = JobEntry {
-            meta: JobMeta {
-                datum_job_idx: 0x07,
-                coinbase_id: 0x00,
-                target_pot_index: 42,
-                version: 0x2000_0000,
-                height: 800_000,
-                coinbase_value: 5_000_000_000,
-                prevhash_bin: {
-                    let mut a = [0u8; 32];
-                    for (i, b) in a.iter_mut().enumerate() {
-                        *b = (i + 1) as u8;
-                    }
-                    a
-                },
-                nbits_bin: [0x20, 0x7f, 0xff, 0xff], // BE display
-                merkle_branches_bin: vec![{
-                    let mut a = [0u8; 32];
-                    for (i, b) in a.iter_mut().enumerate() {
-                        *b = i as u8;
-                    }
-                    a
-                }],
-                coinb1_bin: vec![0xCB, 0x11, 0x22, 0x33, 0x44, 0x55, 0xFF, 0x66, 0x77, 0x88],
-                coinb2_bin: vec![0xC2, 0x99, 0xAA],
-                datum_coinbaser_id: 0x05,
-                txn_count: 0,
-                txn_total_weight: 0,
-                txn_total_size: 0,
-                txn_total_sigops: 0,
-                block_target: [0u8; 32],
-                txn_data_hex: std::sync::Arc::new(vec![]),
-            },
-            server_has_merkle_branches: false,
-            server_has_coinbase: [false; 8],
-        };
-        let share = datum_stratum_sv1::server::SubmittedShare {
-            username: String::new(),
-            job_id: "deadbeef".into(),
-            extranonce2_hex: "a1a2a3a4a5a6a7a8".into(),
-            ntime_hex: "12345678".into(),
-            nonce_hex: "9abcdef0".into(),
-            extranonce1: [0xE1, 0xE2, 0xE3, 0xE4],
-            version_rolling: 0,
-            current_diff: 65536,
-            patched_coinb1_bin: Some(vec![
-                0xCB, 0x11, 0x22, 0x33, 0x44, 0x55, 0x10, 0x66, 0x77, 0x88,
-            ]),
-        };
-        let user = ShareUserConfig {
-            pool_address: "1POOLADDR".into(),
-            pass_full_users: false,
-            pass_workers: false,
-        };
-        let enc = build_share_submission(&share, &mut entry, &user, 65536).unwrap();
-        assert!(enc.block_submission.is_none());
-
-        // Build the canonical expected hex programmatically — every byte
-        // sourced from the C reference (datum_protocol.c:1329-1441).
-        let mut expected = String::new();
-        expected.push_str("27"); // opcode
-        expected.push_str("07"); // datum_job_idx
-        expected.push_str("00"); // coinbase_id
-        expected.push_str("00"); // flags
-        expected.push_str("10"); // target_byte
-        expected.push_str("78563412"); // ntime LE
-        expected.push_str("f0debc9a"); // nonce LE
-        expected.push_str("00000020"); // version LE
-        expected.push_str("0c"); // extranonce_size
-        expected.push_str("e1e2e3e4a1a2a3a4a5a6a7a8"); // extranonce
-        expected.push_str(&hex::encode(b"1POOLADDR"));
-        expected.push_str("00"); // username NUL
-        expected.push_str("00000000"); // 4 reserved zeros
-                                       // 0x01 sub-block
-        expected.push_str("01");
-        for i in 1u8..=32 {
-            expected.push_str(&format!("{i:02x}"));
-        }
-        expected.push_str("2a00"); // target_pot_index u16 LE
-        expected.push_str("ffff7f20"); // nbits LE (reversed from BE display)
-        expected.push_str("05"); // datum_coinbaser_id
-        expected.push_str("00350c00"); // height LE
-        expected.push_str("00f2052a01000000"); // coinbase_value LE
-        expected.push_str("00000000"); // txn_count
-        expected.push_str("00000000"); // txn_total_weight
-        expected.push_str("00000000"); // txn_total_size
-        expected.push_str("00000000"); // txn_total_sigops
-        expected.push_str("01"); // merkle_branch_count
-        for i in (0u8..=31).rev() {
-            expected.push_str(&format!("{i:02x}"));
-        }
-        // 0x02 sub-block (UNPATCHED coinb1)
-        expected.push_str("02");
-        expected.push_str("00"); // coinbase_id
-        expected.push_str("0a00"); // cb1_len LE = 10
-        expected.push_str("0300"); // cb2_len LE = 3
-        expected.push_str("cb1122334455ff667788"); // unpatched coinb1
-        expected.push_str("c299aa"); // coinb2
-                                     // Cap
-        expected.push_str("fe");
-
-        let expected_bytes = hex::decode(&expected).unwrap();
-        let cap_pos = expected_bytes.len();
-        assert!(
-            enc.body.len() > cap_pos && enc.body.len() <= cap_pos + 80,
-            "body length {} outside expected window ({}, {}+80]",
-            enc.body.len(),
-            cap_pos,
-            cap_pos
-        );
-        assert_eq!(
-            hex::encode(&enc.body[..cap_pos]),
-            expected,
-            "structured 0x27 body bytes diverge from C reference"
-        );
-        // Padding shape: all bytes equal, length 1..=80.
-        let pad = &enc.body[cap_pos..];
-        assert!((1..=80).contains(&pad.len()));
-        let p0 = pad[0];
-        assert!(pad.iter().all(|b| *b == p0));
-    }
+    // Byte-fidelity, block-found, double_sha256, hash_meets_target, and
+    // compute_merkle_root tests moved with the implementation to the
+    // `datum-share-relay` crate. See
+    // `crates/datum-share-relay/src/share_encoder.rs` mod tests.
 }

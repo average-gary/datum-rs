@@ -12,6 +12,9 @@ datum-blocktemplates = { path = "../datum-blocktemplates" }
 datum-coinbaser = { path = "../datum-coinbaser" }
 datum-config = { path = "../datum-config" }
 datum-dupes = { path = "../datum-dupes" }
+datum-protocol = { path = "../datum-protocol" }
+datum-share-relay = { path = "../datum-share-relay" }
+hex = { workspace = true }
 stratum-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }

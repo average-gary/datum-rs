@@ -1,0 +1,18 @@
+[package]
+name = "datum-share-relay"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[dependencies]
+datum-protocol = { path = "../datum-protocol" }
+datum-stratum-sv1 = { path = "../datum-stratum-sv1" }
+hex = { workspace = true }
+sha2 = "0.10"
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

@@ -7,6 +7,7 @@ members = [
     "crates/datum-coinbaser",
     "crates/datum-submitblock",
     "crates/datum-protocol",
+    "crates/datum-share-relay",
     "crates/datum-stratum-sv1",
     "crates/datum-stratum-sv2",
     "crates/datum-dupes",
