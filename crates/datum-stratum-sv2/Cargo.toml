@@ -10,13 +10,22 @@ repository.workspace = true
 [dependencies]
 datum-blocktemplates = { path = "../datum-blocktemplates" }
 datum-coinbaser = { path = "../datum-coinbaser" }
+datum-config = { path = "../datum-config" }
 datum-dupes = { path = "../datum-dupes" }
 stratum-core = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
+# SRI's Noise/key types come transitively via stratum-core, but we depend on
+# secp256k1 directly so we can build the Schnorr Keypair/SecretKey we hand to
+# `noise_sv2::Responder::from_authority_kp`. Pin the version SRI uses on this
+# rev so codegen stays consistent.
+secp256k1 = { version = "0.28.2", default-features = false, features = ["alloc", "rand"] }
+bs58 = { version = "0.5", default-features = false, features = ["check", "alloc"] }
 
 [dev-dependencies]
 datum-stratum-sv1 = { path = "../datum-stratum-sv1" }
 hex = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
+secp256k1 = { version = "0.28.2", default-features = false, features = ["alloc", "rand"] }
+bs58 = { version = "0.5", default-features = false, features = ["check", "alloc"] }

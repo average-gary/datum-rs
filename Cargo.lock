@@ -265,6 +265,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "bs58"
+version = "0.5.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bf88ba1141d185c399bee5288d850d63b8369520c1eafc32a0430b5b6c287bf4"
+dependencies = [
+ "sha2 0.10.9",
+ "tinyvec",
+]
+
+[[package]]
 name = "buffer_sv2"
 version = "3.0.1"
 source = "git+https://github.com/stratum-mining/stratum?rev=c7113e7b1b2a0fc1f69d1a17a909a63f27c3121f#c7113e7b1b2a0fc1f69d1a17a909a63f27c3121f"
@@ -693,11 +703,14 @@ dependencies = [
 name = "datum-stratum-sv2"
 version = "0.0.1"
 dependencies = [
+ "bs58",
  "datum-blocktemplates",
  "datum-coinbaser",
+ "datum-config",
  "datum-dupes",
  "datum-stratum-sv1",
  "hex",
+ "secp256k1 0.28.2",
  "stratum-core",
  "thiserror",
  "tokio",

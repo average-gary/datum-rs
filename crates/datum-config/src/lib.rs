@@ -16,7 +16,15 @@ pub const DEFAULT_OCEAN_POOL_PORT: u16 = 28915;
 pub const DEFAULT_OCEAN_POOL_PUBKEY: &str = "f21f2f0ef0aa1970468f22bad9bb7f4535146f8e4a8f646bebc93da3d89b1406f40d032f09a417d94dc068055df654937922d2c89522e3e8f6f0e649de473003";
 
 pub const DEFAULT_STRATUM_LISTEN_PORT: u16 = 23334;
+pub const DEFAULT_STRATUM_V2_LISTEN_ADDR: &str = "0.0.0.0";
 pub const DEFAULT_STRATUM_V2_LISTEN_PORT: u16 = 23335;
+pub const DEFAULT_STRATUM_V2_CERT_VALIDITY_SEC: u32 = 3600;
+/// Hard cap on `cert_validity_sec` per [SRI #2103](https://github.com/stratum-mining/stratum/issues/2103).
+/// `now + cert_validity_sec` is computed as `u32` saturating-add inside SRI's
+/// `noise_sv2` responder; allowing the operator to configure the full year is
+/// fine, but anything above wraps or trips the absolute bound check on
+/// post-2106 deployments. 31_536_000 = 365 * 86_400 = one calendar year.
+pub const STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP: u32 = 31_536_000;
 pub const DEFAULT_API_LISTEN_PORT: u16 = 0;
 
 pub const COINBASE_TAGS_COMBINED_MAX: usize = 88;

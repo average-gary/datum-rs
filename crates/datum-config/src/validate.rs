@@ -4,7 +4,7 @@ use thiserror::Error;
 
 use crate::{
     Config, COINBASE_TAGS_COMBINED_MAX, COINBASE_TAG_INDIVIDUAL_MAX, MAX_EXTRA_BLOCK_SUBMIT_URLS,
-    MAX_EXTRA_BLOCK_SUBMIT_URL_LEN,
+    MAX_EXTRA_BLOCK_SUBMIT_URL_LEN, STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP,
 };
 
 #[derive(Debug, Error)]
@@ -105,12 +105,23 @@ pub enum ValidationError {
     LoggerLevelConsoleOutOfRange { got: i32 },
     #[error("logger.log_level_file={got} out of range [0, 5]")]
     LoggerLevelFileOutOfRange { got: i32 },
+
+    #[error(
+        "stratum_v2.cert_validity_sec={got} exceeds hard cap {STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP} \
+         (1 year) — see SRI #2103 for the overflow rationale"
+    )]
+    StratumV2CertValiditySecTooLarge { got: u32 },
+    #[error("stratum_v2.enabled=true but stratum_v2.authority_pubkey_path is empty")]
+    StratumV2EnabledWithoutAuthorityPubkey,
+    #[error("stratum_v2.enabled=true but stratum_v2.authority_secret_path is empty")]
+    StratumV2EnabledWithoutAuthoritySecret,
 }
 
 pub fn validate(c: &Config) -> Result<(), Vec<ValidationError>> {
     let mut errs = Vec::new();
     validate_bitcoind(c, &mut errs);
     validate_stratum(c, &mut errs);
+    validate_stratum_v2(c, &mut errs);
     validate_mining(c, &mut errs);
     validate_extra_block_submissions(c, &mut errs);
     validate_datum(c, &mut errs);
@@ -204,6 +215,26 @@ fn validate_stratum(c: &Config, errs: &mut Vec<ValidationError>) {
                 modifier: name.clone(),
                 sum,
             });
+        }
+    }
+}
+
+fn validate_stratum_v2(c: &Config, errs: &mut Vec<ValidationError>) {
+    let s = &c.stratum_v2;
+    // The cap applies whether or not the listener is enabled — a config that
+    // sets a too-large value is invalid even if the operator hasn't flipped
+    // `enabled` yet (catches the misconfig early).
+    if s.cert_validity_sec > STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP {
+        errs.push(ValidationError::StratumV2CertValiditySecTooLarge {
+            got: s.cert_validity_sec,
+        });
+    }
+    if s.enabled {
+        if s.authority_pubkey_path.as_os_str().is_empty() {
+            errs.push(ValidationError::StratumV2EnabledWithoutAuthorityPubkey);
+        }
+        if s.authority_secret_path.as_os_str().is_empty() {
+            errs.push(ValidationError::StratumV2EnabledWithoutAuthoritySecret);
         }
     }
 }
@@ -493,5 +524,56 @@ mod tests {
         let c: Config = serde_json::from_str(&json).unwrap();
         assert_eq!(c.stratum.listen_port, 23334);
         assert_eq!(c.datum.pool_host, "datum-beta1.mine.ocean.xyz");
+    }
+
+    #[test]
+    fn stratum_v2_cert_validity_hard_cap_rejects_above_one_year() {
+        let mut c = min_valid_config();
+        c.stratum_v2.cert_validity_sec = STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP + 1;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2CertValiditySecTooLarge { .. }
+        )));
+    }
+
+    #[test]
+    fn stratum_v2_cert_validity_hard_cap_accepts_one_year_exactly() {
+        let mut c = min_valid_config();
+        c.stratum_v2.cert_validity_sec = STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP;
+        c.validate().expect("1-year cert_validity_sec is allowed");
+    }
+
+    #[test]
+    fn stratum_v2_default_disabled_passes() {
+        let c = min_valid_config();
+        assert!(!c.stratum_v2.enabled);
+        c.validate().expect("disabled SV2 listener should not fail");
+    }
+
+    #[test]
+    fn stratum_v2_enabled_without_keys_fails() {
+        let mut c = min_valid_config();
+        c.stratum_v2.enabled = true;
+        // both paths default to empty PathBuf
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2EnabledWithoutAuthorityPubkey
+        )));
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2EnabledWithoutAuthoritySecret
+        )));
+    }
+
+    #[test]
+    fn stratum_v2_enabled_with_keys_passes() {
+        let mut c = min_valid_config();
+        c.stratum_v2.enabled = true;
+        c.stratum_v2.authority_pubkey_path = "/etc/datum/sv2_pub.txt".into();
+        c.stratum_v2.authority_secret_path = "/etc/datum/sv2_sec.txt".into();
+        c.validate().expect("enabled with paths should pass");
+        assert!(c.stratum_v2.is_active());
     }
 }

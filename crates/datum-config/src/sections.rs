@@ -1,10 +1,12 @@
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
 use crate::{
     DEFAULT_API_LISTEN_PORT, DEFAULT_OCEAN_POOL_HOST, DEFAULT_OCEAN_POOL_PORT,
-    DEFAULT_OCEAN_POOL_PUBKEY, DEFAULT_STRATUM_LISTEN_PORT, DEFAULT_STRATUM_V2_LISTEN_PORT,
+    DEFAULT_OCEAN_POOL_PUBKEY, DEFAULT_STRATUM_LISTEN_PORT, DEFAULT_STRATUM_V2_CERT_VALIDITY_SEC,
+    DEFAULT_STRATUM_V2_LISTEN_ADDR, DEFAULT_STRATUM_V2_LISTEN_PORT,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -101,23 +103,57 @@ pub type UsernameModifier = BTreeMap<String, f64>;
 
 /// Stratum V2 listener — additive vs the C gateway. Disabled by default to
 /// preserve drop-in parity with C; operators opt in.
+///
+/// Phase 3 added the Noise authority key paths and `cert_validity_sec`:
+/// these fields are required when the SV2 listener actually starts, but
+/// they default to empty / 1 hour so a caller that omits the entire
+/// `stratum_v2` section is still happy. `is_active()` answers whether
+/// the listener should boot — it requires the operator to have set the
+/// authority pubkey + secret paths explicitly.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StratumV2Config {
     #[serde(default)]
     pub enabled: bool,
-    #[serde(default)]
+    #[serde(default = "default_stratum_v2_listen_addr")]
     pub listen_addr: String,
     #[serde(default = "default_stratum_v2_listen_port")]
     pub listen_port: u16,
+    /// Path to the file holding the pool's authority public key, base58check
+    /// encoded with version `[0x01, 0x00]` per SV2 spec ch.4.
+    #[serde(default)]
+    pub authority_pubkey_path: PathBuf,
+    /// Path to the file holding the pool's authority secret key, base58check
+    /// encoded.
+    #[serde(default)]
+    pub authority_secret_path: PathBuf,
+    /// Lifetime of the per-startup signed server cert, in seconds. Capped by
+    /// [`crate::STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP`] (1 year) per SRI #2103.
+    #[serde(default = "default_stratum_v2_cert_validity_sec")]
+    pub cert_validity_sec: u32,
 }
 
 impl Default for StratumV2Config {
     fn default() -> Self {
         Self {
             enabled: false,
-            listen_addr: String::new(),
+            listen_addr: DEFAULT_STRATUM_V2_LISTEN_ADDR.to_string(),
             listen_port: DEFAULT_STRATUM_V2_LISTEN_PORT,
+            authority_pubkey_path: PathBuf::new(),
+            authority_secret_path: PathBuf::new(),
+            cert_validity_sec: DEFAULT_STRATUM_V2_CERT_VALIDITY_SEC,
         }
+    }
+}
+
+impl StratumV2Config {
+    /// True iff the operator has explicitly configured the SV2 listener. The
+    /// `stratum_v2` section is optional — if absent, the listener does not
+    /// start. We treat "explicitly configured" as `enabled=true` AND both
+    /// authority paths set; either alone is a misconfig caught by validation.
+    pub fn is_active(&self) -> bool {
+        self.enabled
+            && !self.authority_pubkey_path.as_os_str().is_empty()
+            && !self.authority_secret_path.as_os_str().is_empty()
     }
 }
 
@@ -246,8 +282,14 @@ fn default_work_update_seconds() -> i32 {
 fn default_stratum_listen_port() -> u16 {
     DEFAULT_STRATUM_LISTEN_PORT
 }
+fn default_stratum_v2_listen_addr() -> String {
+    DEFAULT_STRATUM_V2_LISTEN_ADDR.to_string()
+}
 fn default_stratum_v2_listen_port() -> u16 {
     DEFAULT_STRATUM_V2_LISTEN_PORT
+}
+fn default_stratum_v2_cert_validity_sec() -> u32 {
+    DEFAULT_STRATUM_V2_CERT_VALIDITY_SEC
 }
 fn default_api_listen_port() -> u16 {
     DEFAULT_API_LISTEN_PORT

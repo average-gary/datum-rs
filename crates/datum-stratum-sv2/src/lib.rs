@@ -30,6 +30,15 @@ use tokio::sync::Mutex;
 
 use datum_coinbaser::{CoinbaseOutput, CoinbaserBlob};
 
+pub mod auth;
+pub mod listener;
+pub mod noise_stream;
+pub mod setup_connection;
+
+pub use auth::{encode_authority_pubkey_b58, AuthorityKey, AuthorityKeyError};
+pub use listener::{Listener, ListenerConfig, ListenerError};
+pub use setup_connection::{handle_setup_connection, SetupConnectionResponse};
+
 /// 32-byte SV2 hierarchical extranonce → 12-byte flat (DATUM upstream
 /// expects a single 12-byte field). Per [sv2-downstream-architecture] §
 /// extranonce mismatch: set ExtranonceAllocator total_extranonce_len = 12,

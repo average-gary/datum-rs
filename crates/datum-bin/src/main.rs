@@ -168,6 +168,36 @@ async fn run_async(cfg: Config) {
     let sv2_registry = datum_stratum_sv2::ChannelRegistry::new();
     runtime.set_sv2_registry(sv2_registry.clone());
 
+    // SV2 listener (Phase 3): bind only when the operator has opted in via
+    // `cfg.stratum_v2.enabled` AND set both authority key paths.
+    // `ListenerConfig::from_datum_config` validates the keys exist + match,
+    // so a misconfigured authority pubkey/secret pair fails loud at startup
+    // rather than silently rejecting every miner cert.
+    let sv2_handle = if cfg.stratum_v2.is_active() {
+        match datum_stratum_sv2::ListenerConfig::from_datum_config(&cfg.stratum_v2) {
+            Ok(sv2_cfg) => {
+                tracing::info!(
+                    sv2_authority_pubkey_b58 = %sv2_cfg.authority.pubkey_b58,
+                    "sv2: authority pubkey (publish to miners for pinning)"
+                );
+                match datum_stratum_sv2::Listener::bind(sv2_cfg).await {
+                    Ok(listener) => Some(tokio::spawn(listener.run())),
+                    Err(e) => {
+                        tracing::error!(error = %e, "sv2 listener bind failed; SV2 disabled");
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!(error = %e, "sv2 listener config build failed; SV2 disabled");
+                None
+            }
+        }
+    } else {
+        tracing::info!("sv2 stratum_v2 listener not configured; SV2 disabled");
+        None
+    };
+
     // RPC client + template puller. If the operator hasn't configured a
     // bitcoind endpoint yet, the gateway runs in "stratum-only / awaiting
     // bitcoind" mode — useful for operator pre-flight.
@@ -503,6 +533,9 @@ async fn run_async(cfg: Config) {
         if let Some(h) = sv1_handle {
             let _ = h.await;
         }
+        if let Some(h) = sv2_handle {
+            h.abort();
+        }
         return;
     }
 
@@ -532,6 +565,13 @@ async fn run_async(cfg: Config) {
     let _ = sv1_shutdown_tx.send(true);
     if let Some(h) = sv1_handle {
         let _ = h.await;
+    }
+    if let Some(h) = sv2_handle {
+        // SV2 listener has no graceful-shutdown channel today; abort the
+        // accept loop. Per-connection tasks running through Noise/SetupConn
+        // also get cancelled via task tree, which is fine — Phase 4 will add
+        // a watch channel like SV1's.
+        h.abort();
     }
     let _ = notify_tx;
 }
