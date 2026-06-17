@@ -634,6 +634,19 @@ impl ChannelManager {
     pub fn channel_ids(&self) -> Vec<u32> {
         self.channels.keys().copied().collect()
     }
+
+    /// Read-only accessor for an open channel. Used by the per-connection
+    /// dispatcher to recover the channel's `extranonce_prefix` /
+    /// `max_target_le` / `is_extended` flag at share-validation time.
+    pub fn channel(&self, channel_id: u32) -> Option<&OpenedChannel> {
+        self.channels.get(&channel_id)
+    }
+
+    /// Snapshot the current `TemplateState` from the watch channel.
+    /// Returns `None` until the publisher has emitted at least one state.
+    pub fn current_template(&self) -> Option<Arc<TemplateState>> {
+        self.template_rx.borrow().clone()
+    }
 }
 
 // ----------------------------------------------------------------------

@@ -169,29 +169,19 @@ async fn run_async(cfg: Config) {
     let sv2_registry = datum_stratum_sv2::ChannelRegistry::new();
     runtime.set_sv2_registry(sv2_registry.clone());
 
-    // SV2 listener (Phase 3): bind only when the operator has opted in via
-    // `cfg.stratum_v2.enabled` AND set both authority key paths.
-    // `ListenerConfig::from_datum_config` validates the keys exist + match,
-    // so a misconfigured authority pubkey/secret pair fails loud at startup
-    // rather than silently rejecting every miner cert.
-    let sv2_handle = if cfg.stratum_v2.is_active() {
+    // SV2 listener (Phase 3): only build the config now; the actual bind +
+    // dispatch wiring happens AFTER the shared `template_state_ch`,
+    // `commands_tx`, `jobs`, and `block_submitter` are constructed below
+    // (Gap 1 — production listener now dispatches post-Setup frames).
+    let sv2_listener_cfg = if cfg.stratum_v2.is_active() {
         match datum_stratum_sv2::ListenerConfig::from_datum_config(&cfg.stratum_v2) {
             Ok(sv2_cfg) => {
                 tracing::info!(
                     sv2_authority_pubkey_b58 = %sv2_cfg.authority.pubkey_b58,
                     "sv2: authority pubkey (publish to miners for pinning)"
                 );
-                // Phase 6: publish the authority pubkey + bind addr to /metrics
-                // BEFORE bind so the row is populated even if bind fails (which
-                // surfaces the misconfig in the JSON the operator polls).
                 runtime.set_sv2_authority_pubkey_b58(sv2_cfg.authority.pubkey_b58.clone());
-                match datum_stratum_sv2::Listener::bind(sv2_cfg).await {
-                    Ok(listener) => Some(tokio::spawn(listener.run())),
-                    Err(e) => {
-                        tracing::error!(error = %e, "sv2 listener bind failed; SV2 disabled");
-                        None
-                    }
-                }
+                Some(sv2_cfg)
             }
             Err(e) => {
                 tracing::error!(error = %e, "sv2 listener config build failed; SV2 disabled");
@@ -384,9 +374,10 @@ async fn run_async(cfg: Config) {
             }
         });
     }
-    // Reserve the channel handle for Phase 4 (SV2 consumer). Holding a clone
-    // here keeps the watch sender alive even if no consumer subscribes yet.
-    let _template_state_ch_reserved_for_sv2 = template_state_ch.clone();
+    // SV2 consumer (Gap 1): each per-connection task subscribes to the same
+    // shared TemplateState by cloning the receiver below. Holding a clone
+    // here also keeps the watch sender alive across listener spawn races.
+    let template_state_ch_for_sv2 = template_state_ch.clone();
 
     // Persistent outbound-commands channel for the DATUM upstream task. Lives
     // across reconnects so other tasks (the share-relay below) can keep a stable
@@ -519,6 +510,83 @@ async fn run_async(cfg: Config) {
             }
         });
     }
+
+    // SV2 listener bind (Gap 1). Now that `template_state_ch`, `commands_tx`,
+    // `jobs`, `block_submitter`, and `user_cfg` are all live, build the
+    // per-connection runtime and bind. Each accepted connection runs the
+    // full Setup -> Open -> Submit dispatch loop and forwards shares back to
+    // the same `commands_tx` SV1 uses (cross-protocol JobTracker sentinel
+    // handles per-(template_seed, coinbase_id) 0x02 first-emission gating).
+    let sv2_handle = if let Some(sv2_cfg) = sv2_listener_cfg {
+        // Bridge SV2's `UpstreamShareCommand::SubmitShare(Vec<u8>)` into
+        // the existing `datum_protocol::UpstreamCommand::SubmitShare(Vec<u8>)`
+        // queue. We keep the SV2 crate free of `datum_protocol` so this thin
+        // adapter lives here.
+        let (sv2_tx, mut sv2_rx) =
+            tokio::sync::mpsc::channel::<datum_stratum_sv2::UpstreamShareCommand>(64);
+        let commands_tx_for_sv2_bridge = commands_tx.clone();
+        tokio::spawn(async move {
+            while let Some(cmd) = sv2_rx.recv().await {
+                match cmd {
+                    datum_stratum_sv2::UpstreamShareCommand::SubmitShare(body) => {
+                        if let Err(e) = commands_tx_for_sv2_bridge
+                            .send(datum_protocol::UpstreamCommand::SubmitShare(body))
+                            .await
+                        {
+                            tracing::warn!(error = %e, "sv2 share-relay: bridge send failed");
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        let block_found_cb: Option<datum_stratum_sv2::BlockFoundCallback> =
+            block_submitter.clone().map(|submitter| {
+                let runtime_for_block = runtime.clone();
+                let cb: datum_stratum_sv2::BlockFoundCallback = Arc::new(move |payload| {
+                    runtime_for_block.record_block_found();
+                    let submitter = submitter.clone();
+                    tracing::warn!(
+                        block_hash = %payload.block_hash_hex,
+                        "BLOCK FOUND (sv2) — submitting to bitcoind"
+                    );
+                    tokio::spawn(async move {
+                        match submitter
+                            .submit(&payload.block_hex, &payload.block_hash_hex)
+                            .await
+                        {
+                            Ok(()) => tracing::info!(
+                                block_hash = %payload.block_hash_hex,
+                                "submitblock accepted (sv2)"
+                            ),
+                            Err(e) => tracing::error!(
+                                error = %e,
+                                block_hash = %payload.block_hash_hex,
+                                "submitblock failed (sv2)"
+                            ),
+                        }
+                    });
+                });
+                cb
+            });
+        let rt = datum_stratum_sv2::ListenerRuntime {
+            cfg: Arc::new(sv2_cfg),
+            template_rx: template_state_ch_for_sv2.into_receiver(),
+            commands_tx: sv2_tx,
+            jobs: jobs.clone(),
+            user_cfg: user_cfg.clone(),
+            block_found: block_found_cb,
+        };
+        match datum_stratum_sv2::Listener::bind_with_runtime(rt).await {
+            Ok(listener) => Some(tokio::spawn(listener.run())),
+            Err(e) => {
+                tracing::error!(error = %e, "sv2 listener bind failed; SV2 disabled");
+                None
+            }
+        }
+    } else {
+        None
+    };
 
     // DATUM upstream task. Spawn it lazily; if the connect fails we log and
     // retry on a fixed backoff. The first successful connect publishes a

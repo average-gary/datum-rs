@@ -58,7 +58,10 @@ pub use channel_manager::{
     clamp_target_to_channel_max, ChannelManager, ChannelOpenError, MiningOut, OpenedChannel,
     MAX_CHANNELS, TOTAL_EXTRANONCE_LEN,
 };
-pub use listener::{Listener, ListenerConfig, ListenerError};
+pub use listener::{
+    BlockFoundCallback, Listener, ListenerConfig, ListenerError, ListenerRuntime,
+    UpstreamShareCommand,
+};
 pub use setup_connection::{handle_setup_connection, SetupConnectionResponse};
 pub use share_path::{
     build_set_target, build_submit_shares_error, build_submit_shares_success,
