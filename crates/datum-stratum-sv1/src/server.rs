@@ -177,8 +177,12 @@ pub async fn run(
     loop {
         tokio::select! {
             biased;
-            _ = shutdown.changed() => {
-                if *shutdown.borrow() {
+            changed = shutdown.changed() => {
+                // `changed.is_err()` ⇔ sender dropped. Treat as shutdown rather
+                // than busy-looping the select arm forever — under
+                // `tokio::test`'s current-thread runtime that busy loop blocks
+                // runtime drop and hangs the test process.
+                if changed.is_err() || *shutdown.borrow() {
                     tracing::info!("sv1 server: shutdown received");
                     return;
                 }
@@ -250,7 +254,14 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
     let (rd, mut wr) = sock.into_split();
     let mut lines = BufReader::new(rd).lines();
     let mut notify_rx = state.notify_rx.clone();
-    let mut pool_min_rx = state.pool_min_diff.clone();
+    // `Some(rx)` while the runtime's pool_min sender is alive; flips to `None`
+    // on first `RecvError` (sender dropped). Storing as Option lets the
+    // select arm conditionally await — without an inert arm a busy-loop or
+    // pending-blocked arm body strands the whole connection task on test
+    // shutdown (preventing `tokio::test`'s current-thread runtime from
+    // dropping the spawned task and hanging the test process).
+    let mut pool_min_rx: Option<tokio::sync::watch::Receiver<u64>> =
+        Some(state.pool_min_diff.clone());
 
     loop {
         tokio::select! {
@@ -568,7 +579,14 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                     }
                 }
             }
-            changed = pool_min_rx.changed() => {
+            changed = async {
+                // Conditional await: when `pool_min_rx` is None, this arm is
+                // permanently inert (returns a never-resolving future).
+                match &mut pool_min_rx {
+                    Some(rx) => rx.changed().await,
+                    None => std::future::pending::<Result<(), tokio::sync::watch::error::RecvError>>().await,
+                }
+            } => {
                 // ClientConfig from the upstream may arrive after the SV1
                 // miner has already connected and started submitting at the
                 // local config floor. Without this branch, the per-connection
@@ -579,13 +597,17 @@ async fn handle_connection(sock: TcpStream, state: ServerState) -> std::io::Resu
                 // Sender-dropped (changed.is_err()) is non-fatal — the runtime
                 // owns the sender and never drops it during normal operation;
                 // tests construct ad-hoc receivers with the sender intentionally
-                // dropped, in which case the floor stays at vardiff.min and we
-                // skip this branch for the rest of the connection's life.
+                // dropped, in which case we permanently retire this arm by
+                // dropping the receiver. The floor stays at vardiff.min for
+                // the rest of the connection's life.
                 if changed.is_err() {
-                    std::future::pending::<()>().await;
-                    unreachable!();
+                    pool_min_rx = None;
+                    continue;
                 }
-                let pool_min = *pool_min_rx.borrow_and_update();
+                let Some(rx) = pool_min_rx.as_mut() else {
+                    continue;
+                };
+                let pool_min = *rx.borrow_and_update();
                 let floor = state.vardiff.min.max(pool_min);
                 if floor > current_diff && subscribed {
                     current_diff = floor;

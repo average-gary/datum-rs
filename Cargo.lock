@@ -348,11 +348,13 @@ version = "0.0.1"
 dependencies = [
  "datum-coinbaser",
  "datum-rpc",
+ "hex",
  "http-body-util",
  "hyper",
  "hyper-util",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror",
  "tokio",
  "tracing",

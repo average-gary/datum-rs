@@ -217,29 +217,33 @@ async fn run_async(cfg: Config) {
     // gated on the first coinbaser response from upstream.
     let (coinbaser_pub, coinbaser_sub) = datum_coinbaser::CoinbaserPublisher::new();
 
-    // Assembler task: when both channels have a value, build mining.notify
-    // params and broadcast to all subscribed SV1 miners. Re-runs on either
-    // channel changing.
+    // Phase 1 of the SV2 listener plan: shared `TemplateState` watch channel.
+    // Both SV1 (today) and SV2 (Phase 4) consume the same `Arc<TemplateState>`
+    // so the prevhash/coinbase/merkle bytes are produced once per (template,
+    // coinbaser) pair. Per the SV2 architecture playbook §6, the watch channel
+    // hands both protocols the same `Arc` on every transition — they cannot
+    // diverge on prevhash.
+    let (template_state_pub, template_state_ch) =
+        datum_blocktemplates::TemplateStatePublisher::new();
     if let Some(template_ch) = template_channel.clone() {
-        let notify_tx_for_assembler = notify_tx.clone();
         let mut t_sub = template_ch.clone();
         let mut c_sub = coinbaser_sub.clone();
         let coinbase_tag_primary = cfg.mining.coinbase_tag_primary.clone();
         let coinbase_tag_secondary = cfg.mining.coinbase_tag_secondary.clone();
         let coinbase_unique_id = cfg.mining.coinbase_unique_id;
-        let jobs_for_assembler = jobs.clone();
-        let pool_coinbase_tag_rx_for_assembler = pool_coinbase_tag_rx.clone();
+        let pool_coinbase_tag_rx_for_state = pool_coinbase_tag_rx.clone();
+        let template_state_pub_for_task = template_state_pub.clone();
         tokio::spawn(async move {
-            let mut tick: u32 = 0;
             // Per-job 2-byte enprefix counter, XOR'd with 0xB10C — mirrors
             // `stratum_enprefix ^ 0xB10C` in datum_stratum.c:71, 2030-2031.
-            // Wraps at u16. Distinguishes consecutive jobs in the coinbase
-            // scriptsig so OCEAN doesn't see duplicate-work patterns.
+            // Lives on the TemplateState driver so the bytes baked into
+            // `coinb1` are stable for both SV1 + SV2 consumers of a given
+            // TemplateState `Arc`.
             let mut enprefix_counter: u16 = 0;
-            // Coinbase variant — our SV1 server doesn't multi-coinbase (yet);
-            // OCEAN's pool dispatches up to 8 in the C reference. Use 0 for
-            // every emitted notify so the relay/upstream side stays consistent.
-            const COINBASE_ID: u8 = 0;
+            // Job-id seed monotonically increases per published TemplateState.
+            // SV1 derives its 18-char hex job-id from this; SV2 will derive
+            // its u32 channel-scoped job-id from the same seed (Phase 4).
+            let mut seed: u64 = 0;
             loop {
                 tokio::select! {
                     biased;
@@ -254,6 +258,55 @@ async fn run_async(cfg: Config) {
                     Some(c) => c,
                     None => continue,
                 };
+                let enprefix = enprefix_counter ^ 0xB10C;
+                enprefix_counter = enprefix_counter.wrapping_add(1);
+                // Pool override semantics match C: when ClientConfig has been
+                // received, override_mining_coinbase_tag_primary unconditionally
+                // wins — even if empty. Only the primary tag is overridable.
+                let pool_override = pool_coinbase_tag_rx_for_state.borrow().clone();
+                let primary_owned: String = match &pool_override {
+                    Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
+                    None => coinbase_tag_primary.clone(),
+                };
+                let scriptsig = datum_blocktemplates::ScriptSigInputs {
+                    coinbase_tag_primary: primary_owned.as_str(),
+                    coinbase_tag_secondary: coinbase_tag_secondary.as_str(),
+                    // Config field is u32 for forward-compat; the C reference's
+                    // uid push only stores 2 bytes — truncate.
+                    coinbase_unique_id: coinbase_unique_id as u16,
+                    enprefix,
+                    pot_placeholder: 0xFF,
+                };
+                let state = datum_blocktemplates::TemplateState::from_template_and_blob(
+                    &template, &coinbaser, scriptsig, seed,
+                );
+                seed = seed.wrapping_add(1);
+                if template_state_pub_for_task.publish(state).is_err() {
+                    return;
+                }
+            }
+        });
+    }
+
+    // SV1 notify assembler: subscribe to the shared TemplateState watch and
+    // emit `mining.notify` jobs. Phase 4 will mirror this with a parallel SV2
+    // assembler that consumes from the same channel and emits
+    // `NewExtendedMiningJob` + `SetNewPrevHash` instead.
+    {
+        let notify_tx_for_assembler = notify_tx.clone();
+        let mut state_sub = template_state_ch.clone();
+        let jobs_for_assembler = jobs.clone();
+        tokio::spawn(async move {
+            let mut tick: u32 = 0;
+            // Coinbase variant — our SV1 server doesn't multi-coinbase (yet);
+            // OCEAN's pool dispatches up to 8 in the C reference. Use 0 for
+            // every emitted notify so the relay/upstream side stays consistent.
+            const COINBASE_ID: u8 = 0;
+            loop {
+                let state = match state_sub.changed().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
                 let datum_job_idx = {
                     let mut g = jobs_for_assembler.lock().await;
                     g.next_idx()
@@ -266,35 +319,14 @@ async fn run_async(cfg: Config) {
                     "{:08x}{:02x}{:04x}",
                     tick,
                     datum_job_idx,
-                    (template.height as u16) ^ 0xC0DE
+                    (state.height as u16) ^ 0xC0DE
                 );
                 let job_id = format!("{head}{COINBASE_ID:02x}");
-                let enprefix = enprefix_counter ^ 0xB10C;
-                enprefix_counter = enprefix_counter.wrapping_add(1);
-                // Pool override semantics match C: when ClientConfig has been
-                // received, override_mining_coinbase_tag_primary unconditionally
-                // wins — even if empty. Only the primary tag is overridable.
-                let pool_override = pool_coinbase_tag_rx_for_assembler.borrow().clone();
-                let primary_owned: String = match &pool_override {
-                    Some(bytes) => String::from_utf8_lossy(bytes).into_owned(),
-                    None => coinbase_tag_primary.clone(),
-                };
-                let scriptsig = datum_stratum_sv1::assembler::ScriptSigInputs {
-                    coinbase_tag_primary: primary_owned.as_str(),
-                    coinbase_tag_secondary: coinbase_tag_secondary.as_str(),
-                    // Config field is u32 for forward-compat; the C reference's
-                    // uid push only stores 2 bytes — truncate.
-                    coinbase_unique_id: coinbase_unique_id as u16,
-                    enprefix,
-                    pot_placeholder: 0xFF,
-                };
-                let (params, meta) = datum_stratum_sv1::assembler::assemble_notify_meta(
+                let (params, meta) = datum_stratum_sv1::assembler::notify_from_template_state(
                     &job_id,
                     datum_job_idx,
                     COINBASE_ID,
-                    &template,
-                    &coinbaser,
-                    scriptsig,
+                    &state,
                     true,
                 );
                 let target_pot_index = meta.target_pot_index;
@@ -316,6 +348,9 @@ async fn run_async(cfg: Config) {
             }
         });
     }
+    // Reserve the channel handle for Phase 4 (SV2 consumer). Holding a clone
+    // here keeps the watch sender alive even if no consumer subscribes yet.
+    let _template_state_ch_reserved_for_sv2 = template_state_ch.clone();
 
     // Persistent outbound-commands channel for the DATUM upstream task. Lives
     // across reconnects so other tasks (the share-relay below) can keep a stable

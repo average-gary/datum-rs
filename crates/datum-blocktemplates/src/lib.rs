@@ -7,6 +7,12 @@ use serde_json::{json, Value};
 use thiserror::Error;
 use tokio::sync::watch;
 
+pub mod template_state;
+pub use template_state::{
+    nbits_to_target_le, swap_prev_hash_for_stratum, ScriptSigInputs, TemplateState,
+    TemplateStateChannel, TemplateStatePublisher, ENPREFIX_LEN, EXTRANONCE_PLACEHOLDER_LEN,
+};
+
 pub const DEFAULT_BACKOFF: Duration = Duration::from_secs(2);
 
 #[derive(Debug, Clone, Deserialize)]
