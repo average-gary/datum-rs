@@ -248,6 +248,10 @@ Author tested against the SRI reference pool at `75.119.150.111:3333` (authority
 | Bitaxe-class devices locked at initial target | `SetTarget` is non-negotiable on day one. |
 | SRI breaking-change cadence (channels_sv2 7.0.0 dropped reference getters) | Re-review at each SRI minor release; keep our wrapper layer thin. |
 | Channels_sv2 share-validation panic after `on_set_new_prev_hash` in custom-work mode (PR #2156) | We don't use custom-work mode (no JD); not exposed. |
+| Two protocols sharing one outbound `commands_tx` need matching send semantics — `try_send` on one side silently drops while the other backpressures. | Both SV1 and SV2 must use `send().await`. See lessons-learned 2026-06-18 §1. |
+| Echoing client-supplied `max_target` without an upper-bound clamp lets a malicious client peg the target to 2^256-1. | Two-layer defense: gate at OpenChannel (reject low `nominal_hash_rate`) + clamp at every `SetTarget` emission. See lessons-learned 2026-06-18 §2. |
+| `on_template_update` rotating job_id on every TemplateState change (including coinbase-only changes) breaks active in-flight shares with `invalid-job-id`. | Only emit `SetNewPrevHash` when `prev_hash` bytes actually change. See lessons-learned 2026-06-18 §3. |
+| `validate_*_share` returning `invalid-job-id` for past-job submissions (instead of `stale-share`) misleads accounting. | Consult `get_past_job` after active-job miss; classify as `Stale`. See lessons-learned 2026-06-18 §4. |
 
 ## See Also
 

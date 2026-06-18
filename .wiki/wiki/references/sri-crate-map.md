@@ -27,6 +27,8 @@ summary: "Current crate layout of `stratum-mining/stratum` (libraries) and `stra
 
 datum-rs (MSRV 1.89) consumes only the **library** crates from `stratum`. Rust is forward-compatible — library code that compiles on 1.75 also compiles on 1.89.
 
+> **Lesson learned (2026-06-18)**: SRI's MSRV pin is a *contributor* constraint, NOT a consumer one. We initially scoped Phase 3 as "blocked on SRI MSRV bump" — that was wrong. See [lessons-learned 2026-06-18 §7](../../raw/notes/2026-06-18-ll-sv2-listener-live-validation.md).
+
 ## Library crates (in `stratum-mining/stratum/sv2/`)
 
 | Path | Crate | Version on main (2026-06-16) | Purpose |
