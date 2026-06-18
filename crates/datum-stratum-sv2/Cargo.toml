@@ -31,10 +31,11 @@ secp256k1 = { version = "0.28.2", default-features = false, features = ["alloc",
 bs58 = { version = "0.5", default-features = false, features = ["check", "alloc"] }
 
 [features]
-# End-to-end test against SRI's `translator_sv2` binary. Requires network +
-# a multi-minute first-time build of the upstream `sv2-apps` workspace, so it
-# is gated behind a feature flag AND the test is `#[ignore]` by default.
-# Run with: `cargo test -p datum-stratum-sv2 --features e2e --test e2e_translator -- --ignored`.
+# End-to-end test against sv2-apps's native SV2 `mining_device` CPU miner.
+# Requires network + a multi-minute first-time build of the upstream
+# `sv2-apps` workspace, so it is gated behind a feature flag AND the test is
+# `#[ignore]` by default.
+# Run with: `cargo test -p datum-stratum-sv2 --features e2e --test e2e_mining_device -- --ignored`.
 e2e = []
 
 [dev-dependencies]
@@ -43,5 +44,3 @@ hex = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "process", "io-util", "time"] }
 secp256k1 = { version = "0.28.2", default-features = false, features = ["alloc", "rand"] }
 bs58 = { version = "0.5", default-features = false, features = ["check", "alloc"] }
-serde_json = { workspace = true }
-tempfile = "3"
