@@ -258,6 +258,13 @@ enum ConnectionError {
     FrameBuild { kind: &'static str },
     #[error("frame parse: {0:?}")]
     Parse(ParserError),
+    /// `commands_tx` (the DATUM upstream sender) returned `SendError`,
+    /// meaning the upstream task has terminated. This per-connection task
+    /// cannot continue forwarding shares — drop the socket so the miner
+    /// reconnects (and, if datum-bin reconnects to the upstream, lands on a
+    /// healthy share-relay).
+    #[error("DATUM upstream commands_tx closed")]
+    UpstreamGone,
 }
 
 /// Per-connection driver. Returns `Ok(())` on a clean close (after Setup
@@ -667,14 +674,25 @@ async fn forward_share_outcome(
 ) -> Result<(), ConnectionError> {
     match outcome {
         ShareOutcome::Valid { body } => {
-            // Forward to DATUM upstream. Drop on backpressure (don't block the
-            // dispatch loop) — operators see this in /metrics counters.
-            if rt
+            // Forward to DATUM upstream with backpressure: `send().await` parks
+            // this per-connection task if the upstream is slow, instead of
+            // dropping shares on a full mpsc. The dispatch loop's `select!` is
+            // not deadlock-prone here — the only producer to `commands_tx` on
+            // this task is *this* call, and the upstream consumer
+            // (`run_datum_upstream`) drains independently. A `SendError`
+            // (channel closed) means the upstream task is gone — that is
+            // catastrophic, so propagate as a connection error and let the
+            // outer accept loop drop this socket cleanly.
+            if let Err(e) = rt
                 .commands_tx
-                .try_send(UpstreamShareCommand::SubmitShare(body))
-                .is_err()
+                .send(UpstreamShareCommand::SubmitShare(body))
+                .await
             {
-                warn!("sv2: share forward dropped (commands_tx full or closed)");
+                error!(
+                    error = %e,
+                    "sv2: commands_tx closed — DATUM upstream task is gone; dropping connection"
+                );
+                return Err(ConnectionError::UpstreamGone);
             }
             // Batched ack — only emit when the accounting layer says so.
             if accounting.should_acknowledge() {
@@ -686,12 +704,23 @@ async fn forward_share_outcome(
             body,
             block_payload,
         } => {
-            if rt
+            // BlockFound: a found-block share that we cannot forward is the
+            // most catastrophic data loss possible. Same `send().await`
+            // backpressure policy; on closed channel log at error! and
+            // propagate so the connection drops cleanly rather than silently
+            // discarding the block.
+            if let Err(e) = rt
                 .commands_tx
-                .try_send(UpstreamShareCommand::SubmitShare(body))
-                .is_err()
+                .send(UpstreamShareCommand::SubmitShare(body))
+                .await
             {
-                warn!("sv2: BlockFound share forward dropped (commands_tx full or closed)");
+                error!(
+                    error = %e,
+                    block_hash = %block_payload.block_hash_hex,
+                    "sv2: BlockFound share forward FAILED — commands_tx closed; \
+                     DATUM upstream task is gone. This share will not reach the pool."
+                );
+                return Err(ConnectionError::UpstreamGone);
             }
             if let Some(cb) = &rt.block_found {
                 cb(block_payload);

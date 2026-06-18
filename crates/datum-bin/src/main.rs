@@ -382,8 +382,15 @@ async fn run_async(cfg: Config) {
     // Persistent outbound-commands channel for the DATUM upstream task. Lives
     // across reconnects so other tasks (the share-relay below) can keep a stable
     // sender. `run_datum_upstream` drains from this on each successful connect.
+    //
+    // Capacity 1024: enough buffer to absorb short DATUM-upstream hiccups
+    // (e.g. OCEAN reconnect, network blip) without producers blocking, but
+    // small enough to backpressure a producer that has truly outpaced the
+    // pool. Both SV1 and SV2 share paths now `send().await` here, so a full
+    // queue parks the per-connection task instead of dropping shares (was 64
+    // pre-fix; live-OCEAN load saturated it within seconds).
     let (commands_tx, commands_rx) =
-        tokio::sync::mpsc::channel::<datum_protocol::UpstreamCommand>(64);
+        tokio::sync::mpsc::channel::<datum_protocol::UpstreamCommand>(1024);
     let commands_rx_shared = std::sync::Arc::new(tokio::sync::Mutex::new(commands_rx));
 
     // Share-relay: pop SubmittedShare from the SV1 submit channel, look up the
