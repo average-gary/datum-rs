@@ -333,6 +333,15 @@ async fn e2e_mining_device_sv2_to_datum_27() {
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: Duration::from_secs(5),
+        // Test fixture overrides — production uses 1 TH/s + 6 SPM. The
+        // CPU-bound `mining_device` advertises hashrate proportional to
+        // its single-core CPU speed (megahash range), nowhere near 1 TH/s,
+        // and it must clear the floor for the channel to open. We also
+        // pick a high `expected_share_per_minute` (60) so the clamped
+        // target stays trivial enough that the first nonce is overwhelmingly
+        // likely to satisfy it within the 60s deadline.
+        min_hashrate_threshold: 1.0e6,
+        expected_share_per_minute: 60.0,
     };
     let rt = ListenerRuntime {
         cfg: Arc::new(cfg),
@@ -371,12 +380,16 @@ async fn e2e_mining_device_sv2_to_datum_27() {
     //   --cores 1                  single-threaded for deterministic timing.
     eprintln!(
         "[e2e] spawning mining_device: {} --address-pool 127.0.0.1:{} \
-         --pubkey-pool {} --id-user e2e-test --nominal-hashrate-multiplier 0.001 \
+         --pubkey-pool {} --id-user e2e-test --nominal-hashrate-multiplier 1.0 \
          --handicap 0 --cores 1",
         miner_bin.display(),
         listener_addr.port(),
         pub_b58,
     );
+    // Bug B (2026-06-16): downstream miners must advertise ≥
+    // `min_hashrate_threshold` H/s. With the test fixture's 1 MH/s floor +
+    // multiplier 1.0 the CPU miner reports its real benchmarked rate
+    // (megahash range on a modern Mac) — well above 1 MH/s.
     let mut child = TokioCommand::new(&miner_bin)
         .args([
             "--address-pool",
@@ -386,7 +399,7 @@ async fn e2e_mining_device_sv2_to_datum_27() {
             "--id-user",
             "e2e-test",
             "--nominal-hashrate-multiplier",
-            "0.001",
+            "1.0",
             "--handicap",
             "0",
             "--cores",

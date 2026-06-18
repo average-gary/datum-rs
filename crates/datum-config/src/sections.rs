@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use crate::{
     DEFAULT_API_LISTEN_PORT, DEFAULT_OCEAN_POOL_HOST, DEFAULT_OCEAN_POOL_PORT,
     DEFAULT_OCEAN_POOL_PUBKEY, DEFAULT_STRATUM_LISTEN_PORT, DEFAULT_STRATUM_V2_CERT_VALIDITY_SEC,
-    DEFAULT_STRATUM_V2_LISTEN_ADDR, DEFAULT_STRATUM_V2_LISTEN_PORT,
+    DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE, DEFAULT_STRATUM_V2_LISTEN_ADDR,
+    DEFAULT_STRATUM_V2_LISTEN_PORT, DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -130,6 +131,19 @@ pub struct StratumV2Config {
     /// [`crate::STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP`] (1 year) per SRI #2103.
     #[serde(default = "default_stratum_v2_cert_validity_sec")]
     pub cert_validity_sec: u32,
+    /// Minimum supported downstream hashrate, in H/s. `OpenChannel` /
+    /// `UpdateChannel` requests with `nominal_hash_rate < min_hashrate_threshold`
+    /// are rejected with `invalid-nominal-hashrate`. The same value drives the
+    /// SetTarget clamp: no emitted target may exceed
+    /// `hash_rate_to_target(min_hashrate_threshold, expected_share_per_minute)`.
+    /// Default 1e12 = 1 TH/s. See live-OCEAN bug B notes in
+    /// [`crate::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD`].
+    #[serde(default = "default_stratum_v2_min_hashrate_threshold")]
+    pub min_hashrate_threshold: f64,
+    /// Per-channel target shares-per-minute. Drives the `min_target` from
+    /// `min_hashrate_threshold`. Default 6.0 (DMND production).
+    #[serde(default = "default_stratum_v2_expected_share_per_minute")]
+    pub expected_share_per_minute: f32,
 }
 
 impl Default for StratumV2Config {
@@ -141,6 +155,8 @@ impl Default for StratumV2Config {
             authority_pubkey_path: PathBuf::new(),
             authority_secret_path: PathBuf::new(),
             cert_validity_sec: DEFAULT_STRATUM_V2_CERT_VALIDITY_SEC,
+            min_hashrate_threshold: DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+            expected_share_per_minute: DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
         }
     }
 }
@@ -290,6 +306,12 @@ fn default_stratum_v2_listen_port() -> u16 {
 }
 fn default_stratum_v2_cert_validity_sec() -> u32 {
     DEFAULT_STRATUM_V2_CERT_VALIDITY_SEC
+}
+fn default_stratum_v2_min_hashrate_threshold() -> f64 {
+    DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD
+}
+fn default_stratum_v2_expected_share_per_minute() -> f32 {
+    DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE
 }
 fn default_api_listen_port() -> u16 {
     DEFAULT_API_LISTEN_PORT

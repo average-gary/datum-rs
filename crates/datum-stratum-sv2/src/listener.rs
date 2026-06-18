@@ -108,6 +108,15 @@ pub struct ListenerConfig {
     pub cert_validity: Duration,
     pub authority: AuthorityKey,
     pub handshake_timeout: Duration,
+    /// Minimum supported downstream hashrate, in H/s. `OpenChannel` and
+    /// `UpdateChannel` requests with `nominal_hash_rate < min_hashrate_threshold`
+    /// are rejected. The same value drives the SetTarget clamp ceiling.
+    /// See live-OCEAN bug B (2026-06-16) and
+    /// [`datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD`].
+    pub min_hashrate_threshold: f64,
+    /// Per-channel target shares-per-minute. Drives `min_target_le` from
+    /// `min_hashrate_threshold` via SRI's `hash_rate_to_target`.
+    pub expected_share_per_minute: f32,
 }
 
 impl ListenerConfig {
@@ -132,6 +141,8 @@ impl ListenerConfig {
             cert_validity: Duration::from_secs(cfg.cert_validity_sec as u64),
             authority,
             handshake_timeout: NOISE_HANDSHAKE_TIMEOUT,
+            min_hashrate_threshold: cfg.min_hashrate_threshold,
+            expected_share_per_minute: cfg.expected_share_per_minute,
         })
     }
 }
@@ -345,8 +356,15 @@ async fn handle_connection(
 
     info!("sv2: SetupConnection.Success sent; entering dispatch loop");
 
-    // Per-connection state.
-    let mut mgr = ChannelManager::new(rt.template_rx.clone()).map_err(|e| {
+    // Per-connection state. The hashrate policy fields on the listener
+    // config flow through to every channel: rejection at OpenChannel /
+    // UpdateChannel and clamping at every SetTarget emission site.
+    let mut mgr = ChannelManager::with_policy(
+        rt.template_rx.clone(),
+        rt.cfg.min_hashrate_threshold,
+        rt.cfg.expected_share_per_minute,
+    )
+    .map_err(|e| {
         warn!(error = ?e, "sv2: ChannelManager init failed");
         ConnectionError::FrameBuild {
             kind: "ChannelManager",
@@ -456,7 +474,9 @@ async fn dispatch_frame(
             mgr.handle_close_channel(close.channel_id);
         }
         (MESSAGE_TYPE_UPDATE_CHANNEL, AnyMessage::Mining(Mining::UpdateChannel(upd))) => {
-            match handle_update_channel(&upd) {
+            // Bug-B: enforce the listener's hashrate policy on every
+            // UpdateChannel — reject < threshold, clamp emitted SetTarget.
+            match handle_update_channel(&upd, rt.cfg.min_hashrate_threshold, mgr.min_target_le()) {
                 Ok(set_target) => {
                     write_mining_frame(writer, MiningOut::SetTarget(set_target)).await?;
                 }

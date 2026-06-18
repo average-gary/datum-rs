@@ -169,7 +169,7 @@ fn close_drops_channel_and_frees_allocator_slot() {
     let out = mgr.handle_open_extended_mining_channel(OpenExtendedMiningChannel {
         request_id: 1,
         user_identity: "worker".to_string().into_bytes().try_into().unwrap(),
-        nominal_hash_rate: 0.0,
+        nominal_hash_rate: 1.3e12,
         max_target: U256::from([0xffu8; 32]),
         min_extranonce_size: 8,
     });
@@ -184,7 +184,7 @@ fn close_drops_channel_and_frees_allocator_slot() {
     let out = mgr.handle_open_extended_mining_channel(OpenExtendedMiningChannel {
         request_id: 2,
         user_identity: "worker".to_string().into_bytes().try_into().unwrap(),
-        nominal_hash_rate: 0.0,
+        nominal_hash_rate: 1.3e12,
         max_target: U256::from([0xffu8; 32]),
         min_extranonce_size: 8,
     });

@@ -65,6 +65,7 @@ use stratum_core::mining_sv2::{
     OpenExtendedMiningChannelSuccess, OpenMiningChannelError, OpenStandardMiningChannel,
     OpenStandardMiningChannelSuccess, SetCustomMiningJobError, SetNewPrevHash, SetTarget,
     SubmitSharesError, SubmitSharesSuccess, UpdateChannelError,
+    ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_NOMINAL_HASHRATE,
     ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_USER_IDENTITY,
 };
 use stratum_core::parsers_sv2::Mining;
@@ -84,6 +85,16 @@ pub const TOTAL_EXTRANONCE_LEN: u8 = 12;
 ///
 /// [hier]: ../../../../.wiki/wiki/concepts/sv2-extranonce-hierarchy.md
 pub const MAX_CHANNELS: u32 = 65_536;
+
+/// Default minimum supported downstream hashrate, in H/s. Mirrors
+/// [`datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD`]. We duplicate
+/// the constant here rather than depending on `datum-config` so this crate
+/// stays config-agnostic at the type level (the listener reads the value
+/// out of `StratumV2Config` and forwards it via [`ChannelManager::with_policy`]).
+pub const DEFAULT_MIN_HASHRATE_THRESHOLD: f64 = 1.0e12;
+/// Default per-channel target shares-per-minute. Mirrors
+/// [`datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE`].
+pub const DEFAULT_EXPECTED_SHARE_PER_MINUTE: f32 = 6.0;
 
 /// Outgoing message produced by a `handle_open_*` call. The connection driver
 /// frames each variant with `Sv2Frame::from_message(msg, msg_type, ext=0,
@@ -268,6 +279,15 @@ pub struct ChannelManager {
     template_rx: watch::Receiver<Option<Arc<TemplateState>>>,
     next_channel_id: u32,
     next_job_id: u32,
+    /// Minimum supported downstream hashrate, in H/s. `OpenChannel` requests
+    /// with `nominal_hash_rate < min_hashrate_threshold` are rejected with
+    /// `invalid-nominal-hashrate`. See live-OCEAN bug B (2026-06-16).
+    min_hashrate_threshold: f64,
+    /// Precomputed `hash_rate_to_target(min_hashrate_threshold,
+    /// expected_share_per_minute).to_le_bytes()`. ANY emitted SetTarget /
+    /// `Open*MiningChannelSuccess.target` is clamped from above by this
+    /// value — a malicious / misconfigured client cannot widen the target.
+    min_target_le: [u8; 32],
 }
 
 impl std::fmt::Debug for ChannelManager {
@@ -282,11 +302,34 @@ impl std::fmt::Debug for ChannelManager {
 }
 
 impl ChannelManager {
-    /// Build a fresh manager. Allocator is configured for our 12-byte
-    /// partition: total=12, local_prefix=0, local_index=2 (auto-derived from
+    /// Build a fresh manager with the production hashrate policy
+    /// (1 TH/s floor + 6 shares/min, per
+    /// [`datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD`] +
+    /// [`datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE`]).
+    /// Allocator is configured for our 12-byte partition: total=12,
+    /// local_prefix=0, local_index=2 (auto-derived from
     /// max_channels=65_536), rollable=10.
+    ///
+    /// Tests / fixtures with non-default policy needs should call
+    /// [`Self::with_policy`] explicitly.
     pub fn new(
         template_rx: watch::Receiver<Option<Arc<TemplateState>>>,
+    ) -> Result<Self, ExtranonceAllocatorError> {
+        Self::with_policy(
+            template_rx,
+            DEFAULT_MIN_HASHRATE_THRESHOLD,
+            DEFAULT_EXPECTED_SHARE_PER_MINUTE,
+        )
+    }
+
+    /// Build a fresh manager with an explicit hashrate policy. Used by the
+    /// listener at boot (forwarding `cfg.stratum_v2.min_hashrate_threshold` +
+    /// `cfg.stratum_v2.expected_share_per_minute`) and by tests that need to
+    /// override the production 1 TH/s floor.
+    pub fn with_policy(
+        template_rx: watch::Receiver<Option<Arc<TemplateState>>>,
+        min_hashrate_threshold: f64,
+        expected_share_per_minute: f32,
     ) -> Result<Self, ExtranonceAllocatorError> {
         let allocator = ExtranonceAllocator::new(Vec::new(), TOTAL_EXTRANONCE_LEN, MAX_CHANNELS)?;
         // Sanity assert the partition matches what the wiki claims. If SRI's
@@ -296,13 +339,30 @@ impl ChannelManager {
         debug_assert_eq!(allocator.local_prefix_len(), 0);
         debug_assert_eq!(allocator.local_index_len(), 2);
         debug_assert_eq!(allocator.rollable_extranonce_size(), 10);
+        let min_target_le = crate::share_path::compute_min_target_le(
+            min_hashrate_threshold,
+            expected_share_per_minute,
+        );
         Ok(Self {
             allocator,
             channels: HashMap::new(),
             template_rx,
             next_channel_id: 1,
             next_job_id: 1,
+            min_hashrate_threshold,
+            min_target_le,
         })
+    }
+
+    /// `min_hashrate_threshold` (H/s) configured at boot.
+    pub fn min_hashrate_threshold(&self) -> f64 {
+        self.min_hashrate_threshold
+    }
+
+    /// Precomputed clamp ceiling — every emitted SetTarget / channel-open
+    /// `target` is `min(client_request, min_target_le)`. LE byte order.
+    pub fn min_target_le(&self) -> [u8; 32] {
+        self.min_target_le
     }
 
     // ------------------------------------------------------------------
@@ -361,6 +421,20 @@ impl ChannelManager {
             }
         };
         let nominal_hash_rate = msg.nominal_hash_rate;
+        // Bug-B layer 1: reject clients that advertise less than our
+        // hashrate floor. SRI's `ExtendedChannel::new` runs an equivalent
+        // check via `hash_rate_to_target` — we explicitly enforce the
+        // datum-rs policy threshold so a misconfigured downstream gets a
+        // clear, actionable error before any SetTarget is computed.
+        if !nominal_hash_rate.is_finite()
+            || nominal_hash_rate <= 0.0
+            || (nominal_hash_rate as f64) < self.min_hashrate_threshold
+        {
+            return vec![MiningOut::OpenMiningChannelError(open_error(
+                request_id,
+                ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_NOMINAL_HASHRATE,
+            ))];
+        }
         // We accept the device's `max_target` as the initial channel target.
         // Phase 5 will narrow this via vardiff; here we just round-trip the
         // bytes so the LE-on-wire round-trip is byte-for-byte verifiable.
@@ -416,10 +490,15 @@ impl ChannelManager {
         let job_id = self.next_job_id;
         self.next_job_id = self.next_job_id.wrapping_add(1);
 
+        // Bug-B layer 2: clamp the success-target to `min_target_le` so a
+        // client cannot widen the target by passing a `max_target` above
+        // our hashrate-floor-derived ceiling.
+        let initial_target_le =
+            crate::share_path::clamp_target_to_min_hashrate_le(max_target_le, self.min_target_le);
         let success = OpenExtendedMiningChannelSuccess {
             request_id,
             channel_id,
-            target: U256::from(max_target_le),
+            target: U256::from(initial_target_le),
             extranonce_size: 10,
             extranonce_prefix: extranonce_prefix_bytes.clone().try_into()?,
             group_channel_id: 0,
@@ -475,6 +554,18 @@ impl ChannelManager {
             }
         };
         let nominal_hash_rate = msg.nominal_hash_rate;
+        // Bug-B layer 1: reject clients that advertise less than our
+        // hashrate floor. See [`Self::handle_open_extended_mining_channel`]
+        // for the rationale.
+        if !nominal_hash_rate.is_finite()
+            || nominal_hash_rate <= 0.0
+            || (nominal_hash_rate as f64) < self.min_hashrate_threshold
+        {
+            return vec![MiningOut::OpenMiningChannelError(open_error(
+                request_id,
+                ERROR_CODE_OPEN_MINING_CHANNEL_INVALID_NOMINAL_HASHRATE,
+            ))];
+        }
         let max_target_le: [u8; 32] = match msg.max_target.inner_as_ref().try_into() {
             Ok(t) => t,
             Err(_) => {
@@ -542,10 +633,15 @@ impl ChannelManager {
         // (≤ 32 bytes). For our 12-byte upstream we pass the full 12 bytes so
         // a downstream reconstructing the coinbase locally still gets the
         // identical prefix the server used in `merkle_root`.
+        //
+        // Bug-B layer 2: clamp the success-target to `min_target_le`. See
+        // [`Self::open_extended_inner`] for the rationale.
+        let initial_target_le =
+            crate::share_path::clamp_target_to_min_hashrate_le(max_target_le, self.min_target_le);
         let success = OpenStandardMiningChannelSuccess {
             request_id: stratum_core::binary_sv2::U32AsRef::from(request_id),
             channel_id,
-            target: U256::from(max_target_le),
+            target: U256::from(initial_target_le),
             extranonce_prefix: extranonce_prefix_bytes.clone().try_into()?,
             group_channel_id: 0,
         };
@@ -908,7 +1004,32 @@ mod tests {
                 1,
             ))
             .unwrap();
+        // Wire-shape unit tests use the production manager (1 TH/s floor +
+        // 6 SPM clamp). New variants below exercise the bug-B floor / clamp
+        // explicitly; a couple of legacy tests need to override to a very
+        // low floor to keep their `nominal_hash_rate = 0.0` payloads valid.
         ChannelManager::new(sub.into_receiver()).unwrap()
+    }
+
+    /// Test fixture: same as [`manager_with_template`] but with a 1 H/s
+    /// floor + 60 SPM ceiling so tests can use synthetic `nominal_hash_rate
+    /// = 0.0`-or-higher payloads without tripping the production bug-B
+    /// rejection. The clamp is still active but loose.
+    fn manager_with_template_low_floor() -> ChannelManager {
+        let (publisher, sub) = TemplateStatePublisher::new();
+        publisher
+            .publish(TemplateState::from_template_and_blob(
+                &template(),
+                &blob(),
+                ScriptSigInputs::default(),
+                1,
+            ))
+            .unwrap();
+        // 1 H/s floor → any positive nominal_hash_rate clears the gate.
+        // 60 SPM target → min_target_le ≈ 2^256/60 — extremely loose, lets
+        // the legacy `target = [0xff; 32]` round-trip mostly intact in the
+        // tests that pin LE byte order.
+        ChannelManager::with_policy(sub.into_receiver(), 1.0, 60.0).unwrap()
     }
 
     #[test]
@@ -952,13 +1073,69 @@ mod tests {
                 assert_eq!(s.extranonce_size, 10);
                 // 2-byte prefix per partition.
                 assert_eq!(s.extranonce_prefix.inner_as_ref().len(), 2);
-                // target round-trips identically (LE-on-wire byte-for-byte).
-                assert_eq!(s.target.inner_as_ref(), &[0xffu8; 32][..]);
+                // Bug-B clamp: requested `[0xff; 32]` is wider than our
+                // `min_target_le` (1 TH/s + 6 SPM); the success-target must
+                // be the clamped value, NOT an echo of the attacker bytes.
+                let on_wire: [u8; 32] = s.target.inner_as_ref().try_into().unwrap();
+                assert_eq!(on_wire, mgr.min_target_le());
+                assert_ne!(on_wire, [0xffu8; 32]);
                 assert!(j.version_rolling_allowed);
             }
             other => panic!("unexpected outputs: {other:?}"),
         }
         assert_eq!(mgr.open_channel_count(), 1);
+    }
+
+    #[test]
+    fn open_extended_below_min_hashrate_yields_invalid_nominal_hashrate() {
+        // Live-OCEAN bug B: a client advertising < 1 TH/s must be rejected.
+        let mut mgr = manager_with_template();
+        let msg = OpenExtendedMiningChannel {
+            request_id: 100,
+            user_identity: "alice".to_string().into_bytes().try_into().unwrap(),
+            nominal_hash_rate: 5.0e9, // 5 GH/s — well below 1 TH/s
+            max_target: U256::from([0xffu8; 32]),
+            min_extranonce_size: 8,
+        };
+        let out = mgr.handle_open_extended_mining_channel(msg);
+        assert_eq!(out.len(), 1);
+        match &out[0] {
+            MiningOut::OpenMiningChannelError(e) => {
+                assert_eq!(e.request_id, 100);
+                assert_eq!(e.error_code.inner_as_ref(), b"invalid-nominal-hashrate");
+            }
+            other => panic!("expected OpenMiningChannelError, got {other:?}"),
+        }
+        // No channel slot consumed.
+        assert_eq!(mgr.open_channel_count(), 0);
+    }
+
+    #[test]
+    fn open_extended_above_min_hashrate_clamps_target() {
+        // 1.3 TH/s clears the floor; the emitted Success.target must be
+        // ≤ min_target_le.
+        let mut mgr = manager_with_template();
+        let min_target = mgr.min_target_le();
+        let msg = OpenExtendedMiningChannel {
+            request_id: 101,
+            user_identity: "alice".to_string().into_bytes().try_into().unwrap(),
+            nominal_hash_rate: 1.3e12,
+            max_target: U256::from([0xffu8; 32]),
+            min_extranonce_size: 8,
+        };
+        let out = mgr.handle_open_extended_mining_channel(msg);
+        let on_wire: [u8; 32] = match &out[0] {
+            MiningOut::OpenExtendedMiningChannelSuccess(s) => {
+                s.target.inner_as_ref().try_into().unwrap()
+            }
+            other => panic!("expected Success, got {other:?}"),
+        };
+        // Compare as 256-bit BE: on_wire must be ≤ min_target.
+        let mut on_le = on_wire;
+        let mut min_le = min_target;
+        on_le.reverse();
+        min_le.reverse();
+        assert!(on_le <= min_le, "Success.target must be ≤ min_target_le");
     }
 
     #[test]
@@ -991,8 +1168,11 @@ mod tests {
                 assert_eq!(s.extranonce_prefix.inner_as_ref().len(), 12);
                 // merkle_root is 32 bytes regardless of branch count.
                 assert_eq!(j.merkle_root.inner_as_ref().len(), 32);
-                // target LE-on-wire.
-                assert_eq!(s.target.inner_as_ref(), &[0xffu8; 32][..]);
+                // Bug-B clamp: target on the wire is min_target_le, not
+                // the echo of attacker `[0xff; 32]`.
+                let on_wire: [u8; 32] = s.target.inner_as_ref().try_into().unwrap();
+                assert_eq!(on_wire, mgr.min_target_le());
+                assert_ne!(on_wire, [0xffu8; 32]);
             }
             other => panic!("unexpected outputs: {other:?}"),
         }
@@ -1004,7 +1184,7 @@ mod tests {
         let msg = OpenExtendedMiningChannel {
             request_id: 1,
             user_identity: "alice".to_string().into_bytes().try_into().unwrap(),
-            nominal_hash_rate: 0.0,
+            nominal_hash_rate: 1.3e12,
             max_target: U256::from([0xffu8; 32]),
             min_extranonce_size: 8,
         };
@@ -1037,18 +1217,20 @@ mod tests {
     #[test]
     fn template_update_re_emits_to_all_channels() {
         let mut mgr = manager_with_template();
-        // Open an extended + a standard.
+        // Open an extended + a standard. Both at ≥ 1 TH/s to clear the
+        // bug-B floor — the template-update path is independent of
+        // hashrate policy, so any value above the floor works.
         let _ = mgr.handle_open_extended_mining_channel(OpenExtendedMiningChannel {
             request_id: 1,
             user_identity: "a".to_string().into_bytes().try_into().unwrap(),
-            nominal_hash_rate: 0.0,
+            nominal_hash_rate: 1.3e12,
             max_target: U256::from([0xffu8; 32]),
             min_extranonce_size: 8,
         });
         let _ = mgr.handle_open_standard_mining_channel(OpenStandardMiningChannel {
             request_id: stratum_core::binary_sv2::U32AsRef::from(2u32),
             user_identity: "b".to_string().into_bytes().try_into().unwrap(),
-            nominal_hash_rate: 0.0,
+            nominal_hash_rate: 1.3e12,
             max_target: U256::from([0xffu8; 32]),
         });
         assert_eq!(mgr.open_channel_count(), 2);
@@ -1078,7 +1260,12 @@ mod tests {
         // GOLDEN: a known target round-trips through OpenExtendedMiningChannelSuccess
         // byte-for-byte. The wire field is U256 LE — i.e. the bytes we pass to
         // U256::from go onto the wire verbatim.
-        let mut mgr = manager_with_template();
+        //
+        // Uses [`manager_with_template_low_floor`] so the bug-B clamp is
+        // effectively unreachable (min_target_le ≈ 2^256/60 — anything less
+        // than the high 1/60th of the 256-bit space round-trips unchanged).
+        // The chosen pattern `target_le[i] = i` (high byte 0x1f) is well below.
+        let mut mgr = manager_with_template_low_floor();
         // target = 0x00000000_ffff_0000... in display BE => internal-LE bytes
         // are  [..., 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00] little end then high.
         // We'll use a distinctive, palindrome-rejecting pattern so a flipped
@@ -1090,7 +1277,7 @@ mod tests {
         let msg = OpenExtendedMiningChannel {
             request_id: 999,
             user_identity: "x".to_string().into_bytes().try_into().unwrap(),
-            nominal_hash_rate: 0.0,
+            nominal_hash_rate: 1.0,
             max_target: U256::from(target_le),
             min_extranonce_size: 8,
         };
@@ -1109,7 +1296,7 @@ mod tests {
 
     #[test]
     fn open_standard_succ_target_serializes_le() {
-        let mut mgr = manager_with_template();
+        let mut mgr = manager_with_template_low_floor();
         let mut target_le = [0u8; 32];
         for (i, b) in target_le.iter_mut().enumerate() {
             *b = i as u8;
@@ -1117,7 +1304,7 @@ mod tests {
         let msg = OpenStandardMiningChannel {
             request_id: stratum_core::binary_sv2::U32AsRef::from(1u32),
             user_identity: "x".to_string().into_bytes().try_into().unwrap(),
-            nominal_hash_rate: 0.0,
+            nominal_hash_rate: 1.0,
             max_target: U256::from(target_le),
         };
         let out = mgr.handle_open_standard_mining_channel(msg);
@@ -1137,7 +1324,7 @@ mod tests {
         let _ = mgr.handle_open_extended_mining_channel(OpenExtendedMiningChannel {
             request_id: 1,
             user_identity: "x".to_string().into_bytes().try_into().unwrap(),
-            nominal_hash_rate: 0.0,
+            nominal_hash_rate: 1.3e12,
             max_target: U256::from([0xffu8; 32]),
             min_extranonce_size: 8,
         });

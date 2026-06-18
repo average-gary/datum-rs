@@ -74,6 +74,10 @@ async fn run_listener_with_files(
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: NOISE_HANDSHAKE_TIMEOUT,
+        // Production hashrate policy. This test only exercises Setup —
+        // no channels — so these values are inert here.
+        min_hashrate_threshold: datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+        expected_share_per_minute: datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
     };
     // We need the actual bound address — bind manually so we can read it.
     let listener = tokio::net::TcpListener::bind(cfg.bind_addr).await.unwrap();
@@ -310,6 +314,9 @@ async fn listener_bind_smoke_uses_real_listener_struct() {
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: NOISE_HANDSHAKE_TIMEOUT,
+        // Production hashrate policy — see fixture above.
+        min_hashrate_threshold: datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+        expected_share_per_minute: datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
     };
     let listener = Listener::bind(cfg).await.expect("bind succeeds");
     // Drop the listener; this test only verifies the constructor path —

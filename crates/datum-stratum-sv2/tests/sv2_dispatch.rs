@@ -390,6 +390,10 @@ async fn dispatch_setup_open_submit_then_template_update() {
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: Duration::from_secs(3),
+        // Production policy. The dispatcher tests advertise
+        // `nominal_hash_rate = 1.3e12`, clearing the 1 TH/s floor.
+        min_hashrate_threshold: datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+        expected_share_per_minute: datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
     };
     let rt = ListenerRuntime {
         cfg: Arc::new(cfg),
@@ -570,6 +574,10 @@ async fn dispatch_set_custom_mining_job_replies_error_keeps_connection_alive() {
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: Duration::from_secs(3),
+        // Production policy. The dispatcher tests advertise
+        // `nominal_hash_rate = 1.3e12`, clearing the 1 TH/s floor.
+        min_hashrate_threshold: datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+        expected_share_per_minute: datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
     };
     let rt = ListenerRuntime {
         cfg: Arc::new(cfg),

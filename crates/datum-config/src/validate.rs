@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::{
     Config, COINBASE_TAGS_COMBINED_MAX, COINBASE_TAG_INDIVIDUAL_MAX, MAX_EXTRA_BLOCK_SUBMIT_URLS,
     MAX_EXTRA_BLOCK_SUBMIT_URL_LEN, STRATUM_V2_CERT_VALIDITY_SEC_HARD_CAP,
+    STRATUM_V2_EXPECTED_SHARE_PER_MINUTE_MAX,
 };
 
 #[derive(Debug, Error)]
@@ -115,6 +116,14 @@ pub enum ValidationError {
     StratumV2EnabledWithoutAuthorityPubkey,
     #[error("stratum_v2.enabled=true but stratum_v2.authority_secret_path is empty")]
     StratumV2EnabledWithoutAuthoritySecret,
+    #[error(
+        "stratum_v2.min_hashrate_threshold={got} must be > 0 and finite (default 1e12 = 1 TH/s)"
+    )]
+    StratumV2MinHashrateThresholdInvalid { got: f64 },
+    #[error(
+        "stratum_v2.expected_share_per_minute={got} must be > 0, finite, and < {STRATUM_V2_EXPECTED_SHARE_PER_MINUTE_MAX} (default 6.0)"
+    )]
+    StratumV2ExpectedSharePerMinuteInvalid { got: f32 },
 }
 
 pub fn validate(c: &Config) -> Result<(), Vec<ValidationError>> {
@@ -236,6 +245,21 @@ fn validate_stratum_v2(c: &Config, errs: &mut Vec<ValidationError>) {
         if s.authority_secret_path.as_os_str().is_empty() {
             errs.push(ValidationError::StratumV2EnabledWithoutAuthoritySecret);
         }
+    }
+    // The hashrate-policy fields apply whether or not the listener is enabled —
+    // a malformed value (NaN, ≤0, exploding magnitude) is a misconfig regardless.
+    if !s.min_hashrate_threshold.is_finite() || s.min_hashrate_threshold <= 0.0 {
+        errs.push(ValidationError::StratumV2MinHashrateThresholdInvalid {
+            got: s.min_hashrate_threshold,
+        });
+    }
+    if !s.expected_share_per_minute.is_finite()
+        || s.expected_share_per_minute <= 0.0
+        || s.expected_share_per_minute >= STRATUM_V2_EXPECTED_SHARE_PER_MINUTE_MAX
+    {
+        errs.push(ValidationError::StratumV2ExpectedSharePerMinuteInvalid {
+            got: s.expected_share_per_minute,
+        });
     }
 }
 
@@ -572,5 +596,71 @@ mod tests {
         c.stratum_v2.authority_secret_path = "/etc/datum/sv2_sec.txt".into();
         c.validate().expect("enabled with paths should pass");
         assert!(c.stratum_v2.is_active());
+    }
+
+    #[test]
+    fn stratum_v2_min_hashrate_must_be_positive_finite() {
+        let mut c = min_valid_config();
+        c.stratum_v2.min_hashrate_threshold = 0.0;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2MinHashrateThresholdInvalid { .. }
+        )));
+
+        c.stratum_v2.min_hashrate_threshold = -1.0;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2MinHashrateThresholdInvalid { .. }
+        )));
+
+        c.stratum_v2.min_hashrate_threshold = f64::NAN;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2MinHashrateThresholdInvalid { .. }
+        )));
+
+        c.stratum_v2.min_hashrate_threshold = f64::INFINITY;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2MinHashrateThresholdInvalid { .. }
+        )));
+    }
+
+    #[test]
+    fn stratum_v2_expected_share_per_minute_must_be_positive_and_reasonable() {
+        let mut c = min_valid_config();
+        c.stratum_v2.expected_share_per_minute = 0.0;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2ExpectedSharePerMinuteInvalid { .. }
+        )));
+
+        c.stratum_v2.expected_share_per_minute = STRATUM_V2_EXPECTED_SHARE_PER_MINUTE_MAX + 1.0;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2ExpectedSharePerMinuteInvalid { .. }
+        )));
+
+        c.stratum_v2.expected_share_per_minute = f32::NAN;
+        let errs = c.validate().unwrap_err();
+        assert!(errs.iter().any(|e| matches!(
+            e,
+            ValidationError::StratumV2ExpectedSharePerMinuteInvalid { .. }
+        )));
+    }
+
+    #[test]
+    fn stratum_v2_default_hashrate_policy_passes() {
+        // The defaults (1 TH/s + 6 SPM) must be valid out of the box.
+        let c = min_valid_config();
+        assert_eq!(c.stratum_v2.min_hashrate_threshold, 1.0e12);
+        assert_eq!(c.stratum_v2.expected_share_per_minute, 6.0);
+        c.validate().expect("defaults should pass");
     }
 }

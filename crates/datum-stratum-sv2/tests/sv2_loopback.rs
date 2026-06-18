@@ -513,6 +513,11 @@ async fn loopback_setup_open_submit_forwards_to_mock_upstream() {
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: NOISE_HANDSHAKE_TIMEOUT,
+        // Test-fixture: 1 TH/s floor — the in-process loopback driver
+        // already advertises `nominal_hash_rate = 1.3e12`. 6 SPM matches
+        // production.
+        min_hashrate_threshold: datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+        expected_share_per_minute: datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
     };
 
     // Bind manually so we can read the assigned port.

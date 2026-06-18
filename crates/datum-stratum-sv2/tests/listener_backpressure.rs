@@ -345,6 +345,10 @@ async fn share_forward_does_not_drop_on_saturated_commands_tx() {
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: Duration::from_secs(5),
+        // Production policy. Tests in this file already advertise
+        // `nominal_hash_rate = 1.3e12` so the floor is cleared.
+        min_hashrate_threshold: datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+        expected_share_per_minute: datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
     };
     let rt = ListenerRuntime {
         cfg: Arc::new(cfg),
@@ -492,6 +496,10 @@ async fn connection_task_exits_cleanly_when_commands_tx_closed() {
         cert_validity: Duration::from_secs(60),
         authority: AuthorityKey::load(&pub_path, &sec_path).unwrap(),
         handshake_timeout: Duration::from_secs(5),
+        // Production policy. Tests in this file already advertise
+        // `nominal_hash_rate = 1.3e12` so the floor is cleared.
+        min_hashrate_threshold: datum_config::DEFAULT_STRATUM_V2_MIN_HASHRATE_THRESHOLD,
+        expected_share_per_minute: datum_config::DEFAULT_STRATUM_V2_EXPECTED_SHARE_PER_MINUTE,
     };
     let rt = ListenerRuntime {
         cfg: Arc::new(cfg),

@@ -267,7 +267,9 @@ only read the file at boot.
     "listen_port": 23335,
     "authority_pubkey_path": "/path/to/sv2-authority-pubkey.b58",
     "authority_secret_path": "/path/to/sv2-authority-secret.b58",
-    "cert_validity_sec": 3600
+    "cert_validity_sec": 3600,
+    "min_hashrate_threshold": 1.0e12,
+    "expected_share_per_minute": 6.0
   }
 }
 ```
@@ -276,6 +278,30 @@ only read the file at boot.
 to dodge SRI #2103 (the Noise responder's `now + cert_validity_sec` is a
 saturating-u32 add — anything above the cap risks wrap on post-2106
 deployments).
+
+`min_hashrate_threshold` (default `1.0e12` = 1 TH/s) is the minimum
+hashrate a downstream is allowed to advertise. `OpenChannel` and
+`UpdateChannel` requests with `nominal_hash_rate < min_hashrate_threshold`
+are rejected with `invalid-nominal-hashrate`. The same value drives the
+`SetTarget` clamp ceiling: every emitted target — `Open*MiningChannelSuccess.target`,
+`SetTarget` from `UpdateChannel`, `SetTarget` from the vardiff loop — is
+clamped from above by `hash_rate_to_target(min_hashrate_threshold,
+expected_share_per_minute)`. Smaller targets (i.e. higher difficulty)
+pass through unchanged. This is the live-OCEAN bug-B fix
+(2026-06-16): a misconfigured `mining_device` advertising
+`--nominal-hashrate-multiplier 0.001` previously caused the listener to
+echo back `target = 0xff..ff = 2^256-1`, accepting every nonce and
+producing a share storm of millions of "valid" shares per second. The
+1 TH/s floor is a conservative production default — bitcoin ASICs in
+2026 ship at 100+ TH/s; CPU/GPU miners are not viable downstream
+clients at modern difficulty regardless.
+
+`expected_share_per_minute` (default `6.0`, mirroring DMND production)
+controls how often a per-channel miner is expected to submit. Combined
+with `min_hashrate_threshold` it pins the SetTarget clamp ceiling to
+roughly `2^228` in big-endian display order (i.e. `00000000001c25c2…`
+at the defaults — well below `00000000ffff0000…` aka the diff=1 ceiling
+the bitcoin protocol allows).
 
 ### Expected log line sequence
 

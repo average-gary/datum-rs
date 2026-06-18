@@ -105,7 +105,11 @@ fn manager_with_template() -> ChannelManager {
             1,
         ))
         .unwrap();
-    ChannelManager::new(sub.into_receiver()).unwrap()
+    // Use a 1 H/s floor + 60 SPM ceiling so these wire-format goldens
+    // (which pin a small `GOLDEN_LE_PATTERN` value as the channel target)
+    // round-trip unchanged. The bug-B clamp is still active but loose
+    // enough that anything below ~2^256/60 passes through.
+    ChannelManager::with_policy(sub.into_receiver(), 1.0, 60.0).unwrap()
 }
 
 // ---------------------------------------------------------------------------
@@ -148,7 +152,8 @@ fn golden_open_standard_mining_channel_success_target_le() {
     let msg = OpenStandardMiningChannel {
         request_id: stratum_core::binary_sv2::U32AsRef::from(7u32),
         user_identity: "alice".to_string().into_bytes().try_into().unwrap(),
-        nominal_hash_rate: 0.0,
+        // 1 H/s clears the test fixture floor (1 H/s) — see manager_with_template.
+        nominal_hash_rate: 1.0,
         max_target: U256::from(GOLDEN_LE_PATTERN),
     };
     let out = mgr.handle_open_standard_mining_channel(msg);
@@ -209,7 +214,8 @@ fn golden_open_extended_mining_channel_success_target_le() {
     let msg = OpenExtendedMiningChannel {
         request_id: 999,
         user_identity: "alice".to_string().into_bytes().try_into().unwrap(),
-        nominal_hash_rate: 0.0,
+        // 1 H/s clears the test fixture floor (1 H/s) — see manager_with_template.
+        nominal_hash_rate: 1.0,
         max_target: U256::from(GOLDEN_LE_PATTERN),
         min_extranonce_size: 8,
     };
@@ -303,7 +309,8 @@ fn golden_new_extended_mining_job_full_frame() {
     let msg = OpenExtendedMiningChannel {
         request_id: 1,
         user_identity: "x".to_string().into_bytes().try_into().unwrap(),
-        nominal_hash_rate: 0.0,
+        // 1 H/s clears the test fixture floor (1 H/s) — see manager_with_template.
+        nominal_hash_rate: 1.0,
         max_target: U256::from([0xffu8; 32]),
         min_extranonce_size: 8,
     };

@@ -46,6 +46,7 @@ use datum_share_relay::{
 };
 use stratum_core::binary_sv2::{Str0255, U256};
 use stratum_core::channels_sv2::server::share_accounting::ShareAccounting;
+use stratum_core::channels_sv2::target::hash_rate_to_target;
 use stratum_core::mining_sv2::{
     SetCustomMiningJob, SetCustomMiningJobError, SetTarget, SubmitSharesError,
     SubmitSharesExtended, SubmitSharesStandard, SubmitSharesSuccess, UpdateChannel,
@@ -461,6 +462,50 @@ pub fn build_set_target(channel_id: u32, target_le: [u8; 32]) -> SetTarget<'stat
     }
 }
 
+/// Compute `min_target` (LE bytes) from a hashrate floor and the per-channel
+/// shares-per-minute target, via SRI's `hash_rate_to_target`. Mirrors
+/// `ExtendedChannel::new`'s initial-target derivation but exposed standalone
+/// so the listener can precompute one value at boot and reuse it as the
+/// SetTarget clamp ceiling.
+///
+/// Returns `[0xFF; 32]` (i.e. no clamping) only on `hash_rate_to_target`
+/// failure (zero / negative / non-finite inputs). The config validation
+/// rejects those cases at boot, so a runtime fall-back to `0xFF` here is
+/// purely defensive — it preserves the pre-existing "echo client target"
+/// behavior rather than denying every channel.
+pub fn compute_min_target_le(
+    min_hashrate_threshold: f64,
+    expected_share_per_minute: f32,
+) -> [u8; 32] {
+    match hash_rate_to_target(min_hashrate_threshold, expected_share_per_minute as f64) {
+        Ok(t) => t.to_le_bytes(),
+        Err(_) => [0xFFu8; 32],
+    }
+}
+
+/// Clamp `proposed_le` to be no larger than `min_target_le`, where both are
+/// 32-byte little-endian targets compared as 256-bit big-endian unsigned
+/// integers. Returns `min(proposed_le, min_target_le)`.
+///
+/// "Larger" here means "easier difficulty" — every emitted SetTarget MUST
+/// be ≤ `min_target_le` per the bug-B policy: regardless of vardiff state,
+/// `OpenChannel.max_target` echo, or any future code path, the listener
+/// never advertises a target above the floor implied by
+/// `min_hashrate_threshold`. See live-OCEAN bug B (2026-06-16).
+pub fn clamp_target_to_min_hashrate_le(proposed_le: [u8; 32], min_target_le: [u8; 32]) -> [u8; 32] {
+    // Walk MSB→LSB (LE byte 31 down to byte 0).
+    for i in (0..32).rev() {
+        if proposed_le[i] > min_target_le[i] {
+            return min_target_le;
+        }
+        if proposed_le[i] < min_target_le[i] {
+            return proposed_le;
+        }
+    }
+    // Equal — either is fine; return the proposed bytes verbatim.
+    proposed_le
+}
+
 /// Build an `UpdateChannelError` reply.
 pub fn build_update_channel_error(
     channel_id: u32,
@@ -473,25 +518,38 @@ pub fn build_update_channel_error(
 }
 
 /// Validate `UpdateChannel` and return either a new `SetTarget` or an
-/// `UpdateChannelError`. Mirrors SRI `ExtendedChannel::update_channel`'s
-/// error policy: invalid hashrate (≤0 / NaN) → `invalid-nominal-hashrate`.
+/// `UpdateChannelError`. Two layers of policy (live-OCEAN bug B):
+///
+/// 1. Rejection: `nominal_hash_rate < min_hashrate_threshold` (or ≤0 / NaN /
+///    non-finite) → `UpdateChannelError(invalid-nominal-hashrate)`.
+/// 2. Clamp: even on accept, the emitted `SetTarget` is clamped from above
+///    by `min_target_le` so a malicious / malformed client cannot widen the
+///    target by feeding back its own `maximum_target`.
 pub fn handle_update_channel(
     msg: &UpdateChannel<'_>,
+    min_hashrate_threshold: f64,
+    min_target_le: [u8; 32],
 ) -> Result<SetTarget<'static>, UpdateChannelError<'static>> {
-    if msg.nominal_hash_rate <= 0.0 || !msg.nominal_hash_rate.is_finite() {
+    if !msg.nominal_hash_rate.is_finite()
+        || msg.nominal_hash_rate <= 0.0
+        || (msg.nominal_hash_rate as f64) < min_hashrate_threshold
+    {
         return Err(build_update_channel_error(
             msg.channel_id,
             ERROR_CODE_UPDATE_CHANNEL_INVALID_NOMINAL_HASHRATE,
         ));
     }
-    // Echo back the requested max_target as the new channel target. SRI's
-    // implementation clamps target = min(hashrate→target, requested_max).
-    // We follow the simpler "honor requested_max_target" policy because we
-    // have no per-channel `expected_share_per_minute` outside vardiff.
-    let target_bytes: [u8; 32] = msg.maximum_target.inner_as_ref().try_into().map_err(|_| {
+    // Read back the client-requested target, then clamp from above by
+    // `min_target_le` — never trust a client to choose a target above the
+    // policy floor. See live-OCEAN bug B (2026-06-16): a misconfigured
+    // mining_device advertised `--nominal-hashrate-multiplier 0.001` and
+    // our previous code echoed back `maximum_target = 0xff..ff = 2^256-1`,
+    // making every nonce a "valid share."
+    let requested: [u8; 32] = msg.maximum_target.inner_as_ref().try_into().map_err(|_| {
         build_update_channel_error(msg.channel_id, ERROR_CODE_UPDATE_CHANNEL_INVALID_CHANNEL_ID)
     })?;
-    Ok(build_set_target(msg.channel_id, target_bytes))
+    let clamped = clamp_target_to_min_hashrate_le(requested, min_target_le);
+    Ok(build_set_target(msg.channel_id, clamped))
 }
 
 /// Build a `SetCustomMiningJobError` (msg 0x24) reply for an unsolicited
@@ -732,7 +790,7 @@ mod tests {
             nominal_hash_rate: -1.0,
             maximum_target: U256::from([0xffu8; 32]),
         };
-        let res = handle_update_channel(&msg);
+        let res = handle_update_channel(&msg, 1.0e12, [0xFFu8; 32]);
         assert!(res.is_err());
         let err = res.unwrap_err();
         assert_eq!(err.channel_id, 7);
@@ -741,6 +799,9 @@ mod tests {
 
     #[test]
     fn handle_update_channel_valid_yields_set_target() {
+        // With `min_target_le = 0xff..ff` (no clamp) the requested-target bytes
+        // round-trip onto the wire byte-for-byte. This pins the LE-on-wire
+        // contract for SetTarget without exercising the clamp.
         let mut bytes = [0u8; 32];
         for (i, b) in bytes.iter_mut().enumerate() {
             *b = i as u8;
@@ -750,12 +811,123 @@ mod tests {
             nominal_hash_rate: 1.3e12,
             maximum_target: U256::from(bytes),
         };
-        let res = handle_update_channel(&msg);
+        let res = handle_update_channel(&msg, 1.0e12, [0xFFu8; 32]);
         assert!(res.is_ok());
         let st = res.unwrap();
         assert_eq!(st.channel_id, 3);
         // LE-on-wire round-trip: bytes go onto the wire verbatim.
         assert_eq!(st.maximum_target.inner_as_ref(), &bytes[..]);
+    }
+
+    #[test]
+    fn handle_update_channel_below_min_hashrate_rejects_invalid_nominal_hashrate() {
+        // 1 GH/s falls under the 1 TH/s policy floor.
+        let msg = UpdateChannel {
+            channel_id: 9,
+            nominal_hash_rate: 1.0e9,
+            maximum_target: U256::from([0xffu8; 32]),
+        };
+        let res = handle_update_channel(&msg, 1.0e12, [0xFFu8; 32]);
+        let err = res.unwrap_err();
+        assert_eq!(err.channel_id, 9);
+        assert_eq!(err.error_code.inner_as_ref(), b"invalid-nominal-hashrate");
+    }
+
+    #[test]
+    fn handle_update_channel_clamps_attacker_max_target() {
+        // Client requests `0xff..ff` (the bug-B exploit). With a policy
+        // `min_target_le` derived from 1 TH/s + 6 SPM, the emitted SetTarget
+        // MUST be clamped to `min_target_le`, NOT echoed.
+        let min_target_le = compute_min_target_le(1.0e12, 6.0);
+        let msg = UpdateChannel {
+            channel_id: 11,
+            nominal_hash_rate: 5.0e12,
+            maximum_target: U256::from([0xffu8; 32]),
+        };
+        let res = handle_update_channel(&msg, 1.0e12, min_target_le);
+        let st = res.expect("5 TH/s ≥ 1 TH/s floor — accept and clamp");
+        assert_eq!(st.channel_id, 11);
+        let on_wire: [u8; 32] = st.maximum_target.inner_as_ref().try_into().unwrap();
+        assert_eq!(on_wire, min_target_le, "must clamp to min_target_le");
+        assert_ne!(on_wire, [0xffu8; 32], "must NOT echo attacker bytes");
+    }
+
+    #[test]
+    fn clamp_target_to_min_hashrate_le_returns_smaller() {
+        let big = [0xffu8; 32];
+        let mut small = [0u8; 32];
+        small[0] = 0xff;
+        small[31] = 0x00;
+        // big > small as 256-bit BE int: clamp returns small.
+        assert_eq!(clamp_target_to_min_hashrate_le(big, small), small);
+        // small < big: clamp returns small (unchanged).
+        assert_eq!(clamp_target_to_min_hashrate_le(small, big), small);
+        // Equal → either; assert pinned bytes round-trip.
+        assert_eq!(clamp_target_to_min_hashrate_le(big, big), big);
+    }
+
+    #[test]
+    fn vardiff_target_clamped_to_min_target_when_too_easy() {
+        // Simulate the vardiff loop emitting a SetTarget for a low diff
+        // (which produces a LARGE target — easier difficulty). The clamp
+        // MUST replace it with `min_target_le`.
+        //
+        // diff_to_target_le(1) = max_target ≈ 0x00000000FFFF0000... (BE),
+        // i.e. the easiest legal target. min_target at 1 TH/s + 6 SPM is
+        // much smaller — so the clamp picks min_target.
+        let easy_target_le = diff_to_target_le(1);
+        let min_target_le = compute_min_target_le(1.0e12, 6.0);
+        let clamped = clamp_target_to_min_hashrate_le(easy_target_le, min_target_le);
+        assert_eq!(
+            clamped, min_target_le,
+            "easy vardiff target must be clamped down to min_target_le"
+        );
+        assert_ne!(
+            clamped, easy_target_le,
+            "the clamp must have actually fired"
+        );
+
+        // And the inverse: a HARD vardiff target (diff = 1<<30 — much higher
+        // difficulty, much smaller target) is NOT clamped — passes through.
+        let hard_target_le = diff_to_target_le(1u64 << 30);
+        let clamped_hard = clamp_target_to_min_hashrate_le(hard_target_le, min_target_le);
+        assert_eq!(
+            clamped_hard, hard_target_le,
+            "hard vardiff target should pass through unchanged"
+        );
+    }
+
+    #[test]
+    fn compute_min_target_le_at_one_th_six_spm_is_well_below_max() {
+        // Sanity-check: at 1 TH/s + 6 SPM, the resulting target is
+        // significantly below 2^256-1 (which would mean "no clamp at all").
+        // We don't pin exact bytes here — that's tested in BENCH_VALIDATION
+        // and the SRI helper's own test suite — but we assert the high byte
+        // is zero (i.e. the target fits in less than 256 bits, comfortably).
+        let t = compute_min_target_le(1.0e12, 6.0);
+        // Print for the humans — `cargo test -- --nocapture` surfaces this
+        // so an operator can sanity-check it against bitcoin difficulty
+        // convention.
+        let mut be = t;
+        be.reverse();
+        eprintln!(
+            "min_target_le (LE bytes): {}",
+            t.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        eprintln!(
+            "min_target (BE display):  {}",
+            be.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        // The MSB (byte 31 in LE) must be zero — anything else means the
+        // target is in the upper 1/256th of the 256-bit space, which a
+        // 1 TH/s miner could not plausibly clear at 6 shares/min.
+        assert_eq!(t[31], 0, "1 TH/s + 6 SPM target must have zero MSB");
+        // Lower-order bytes must be non-zero — otherwise the target is
+        // effectively zero (impossible to satisfy).
+        assert!(
+            t.iter().any(|&b| b != 0),
+            "1 TH/s + 6 SPM target must be non-zero"
+        );
     }
 
     #[test]
