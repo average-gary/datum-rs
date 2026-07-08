@@ -38,7 +38,7 @@ tracing-appender = "0.2"
 thiserror = "2"
 bytes = "1"
 hex = "0.4"
-stratum-core = { git = "https://github.com/stratum-mining/stratum", rev = "c7113e7b1b2a0fc1f69d1a17a909a63f27c3121f" }
+stratum-core = { git = "https://github.com/stratum-mining/stratum", tag = "v1.10.0" }
 
 [profile.release]
 lto = "thin"

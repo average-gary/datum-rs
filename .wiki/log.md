@@ -6,3 +6,4 @@
 ## [2026-06-16] plan | "Stratum v2 listener" → output/plan-stratum-v2-listener-2026-06-16.md (8 articles consulted, 6 decisions, 6 phases)
 ## [2026-06-18] update | sv2-downstream-architecture §12 — added SRI mining_device (in-CI) and mujina#65 (pending-merge) to the downstream-clients list
 ## [2026-06-18] ll | "SV2 listener implementation + live OCEAN validation" → raw/notes/2026-06-18-ll-sv2-listener-live-validation.md (7 lessons, 2 articles updated)
+## [2026-07-08] update | sri-crate-map — pin policy switched from mid-branch SHA to release tag; `stratum-core = { tag = "v1.10.0" }`. Noted post-v1.10 breaks upstream (U32AsRef removed, inner_as_ref → as_bytes, Error variant pruning) to expect on next release bump.

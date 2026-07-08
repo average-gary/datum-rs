@@ -20,7 +20,10 @@ fn _bound_check<T: HandleMiningMessagesFromClientAsync>(_: &T) {}
 
 #[test]
 fn sri_imports_resolve() {
-    // `type_name` of a concrete type forces full resolution.
-    let _ = std::any::type_name::<ExtendedChannel>();
+    // The `use` statements above are compile-time path checks; if SRI renames
+    // or moves any of them the file fails to compile before this test runs.
+    // `ExtendedChannel` shape (generic vs. not) has shifted across SRI
+    // versions, so we only assert path resolution here — the concrete
+    // wiring is exercised by the loopback/wire-golden tests.
     let _ = std::any::type_name::<SubmitSharesExtended>();
 }

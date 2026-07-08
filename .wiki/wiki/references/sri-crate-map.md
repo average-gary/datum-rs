@@ -5,12 +5,12 @@ sources:
   - raw/repos/2026-06-16-sri-stratum-mining-stratum.md
   - raw/repos/2026-06-16-sri-pool-channel-manager-impl.md
 created: 2026-06-16
-updated: 2026-06-16
+updated: 2026-07-08
 tags: [sri, sv2, crates, msrv, dependencies]
 aliases: ["SRI crates", "stratum-mining/stratum crate map"]
 confidence: high
 volatility: hot
-verified: 2026-06-16
+verified: 2026-07-08
 summary: "Current crate layout of `stratum-mining/stratum` (libraries) and `stratum-mining/sv2-apps` (binaries). Includes versions on main as of 2026-06-16, MSRV pins, and which crates datum-rs needs."
 ---
 
@@ -71,14 +71,35 @@ datum-rs (MSRV 1.89) consumes only the **library** crates from `stratum`. Rust i
 
 ## datum-rs Cargo dependency pattern
 
-Mirror `stratum-mining/sv2-apps/stratum-apps/Cargo.toml`:
+Pin to a **release tag**, not a mid-branch SHA:
 
 ```toml
-[dependencies]
-stratum-core = { git = "https://github.com/stratum-mining/stratum", rev = "<pin>" }
+[workspace.dependencies]
+stratum-core = { git = "https://github.com/stratum-mining/stratum", tag = "v1.10.0" }
 ```
 
-Pin a specific rev. Re-review at each SRI minor release (cadence: monthly — v1.6 Nov 2025, v1.7 Jan 2026, v1.8 Mar 2026, v1.9 May 2026, v1.10 Jun 2026).
+**Current pin: `v1.10.0`** (SHA `f465e0a8`, released 2026-06-03).
+
+### Bump-on-release process
+
+Watch <https://github.com/stratum-mining/stratum/releases>. On each new release tag:
+
+1. Update `tag = "..."` in `/Cargo.toml`.
+2. `cargo update -p stratum-core && cargo build --workspace --all-targets && cargo test --workspace`.
+3. Fix any API-rename churn (see "known upcoming breaks" below).
+4. Commit as `chore(sv2): bump stratum-core to <tag>`.
+
+SRI release cadence: ~monthly (v1.6 Nov 2025, v1.7 Jan 2026, v1.8 Mar 2026, v1.9 May 2026, v1.10 Jun 2026).
+
+### Known upcoming breaks (post-v1.10.0 `main`, not yet released)
+
+As of 2026-07-08, `main` is 34 commits ahead of v1.10.0. When the next release lands, expect:
+
+- **`binary-sv2`**: `U32AsRef` removed. `OpenStandardMiningChannel.request_id` and `OpenStandardMiningChannelSuccess.request_id` become plain `u32`. Affects ~7 call sites in `datum-stratum-sv2` (`channel_manager.rs` + tests).
+- **`binary-sv2`**: `.inner_as_ref()` → `.as_bytes()` on `Str0255`/`B0255`/`B064K`, `.as_slice()` on `Seq0255`, `.into_array()` / `.to_array()` on `U256`. ~30 call sites (`share_path.rs`, `channel_manager.rs`, `setup_connection.rs`, tests).
+- **`binary-sv2::Error`**: variants pruned — `NotABool`, `InvalidU256`, `InvalidB0255Size`, `InvalidB064KSize`, `InvalidB016MSize`, `InvalidSeq0255Size`, `UnknownMessageType`, `NonPrimitiveTypeCannotBeEncoded`, `InvalidSignatureSize`, `U24TooBig` removed. `OutOfBound` in some paths becomes `ReadError(offset, len)`. Not currently matched by us, but check on bump.
+- **`channels-sv2`**: `ExtendedChannel<'a, J>` and other job-generic types lose the `J` param (JobStore refactor). Our `sri_dep_resolves.rs` test already handles both shapes via `use`-only path checks.
+- **`u256_from_int`** helper removed from `binary_sv2` — we don't use it.
 
 ## What to import for the SV2 Pool role
 
